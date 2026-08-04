@@ -1,0 +1,8 @@
+generator.py
+test.jpg
+*.zip
+*.rar
+*.7z
+tmp_uploads/
+__pycache__/
+.env
