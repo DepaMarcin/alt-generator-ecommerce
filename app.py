@@ -2,6 +2,7 @@ import os
 import re
 import io
 import csv
+import json
 import random
 import uuid
 import ipaddress
@@ -158,6 +159,18 @@ def build_product_context(title: str, brand: str, breadcrumbs: str, specs_text: 
     return context[:CONTEXT_MAX_CHARS] if context else "Brak dodatkowego kontekstu tekstowego."
 
 
+def build_image_ai_context(page_context: str, image_hint: str) -> str:
+    """Combines the page-level product context with one specific image's own
+    hint (its alt/title text). The hint - what that picture actually shows,
+    e.g. an accessory like "narty do wózka" - takes priority over the page's
+    overall product name so the AI doesn't repeat the same product name on
+    every single image regardless of what's actually depicted."""
+    hint = clean_product_title_for_context(image_hint)
+    if hint and hint.lower() not in page_context.lower():
+        return f"Na zdjęciu widać: {hint} | {page_context}"[:CONTEXT_MAX_CHARS]
+    return page_context
+
+
 # ---------------------------------------------------------------------------
 # Streaming HTML parsing (lxml.etree.iterparse) - keeps memory bounded on very
 # large exported HTML files by clearing each product block once it's been read.
@@ -183,8 +196,20 @@ def _first_match_text(elem, class_re) -> str:
     return ""
 
 
+def _is_fetchable_url(url: str) -> bool:
+    """False for the local "./xxx_files/image.jpg" references a browser's
+    "Save Complete Webpage" leaves behind instead of the real, downloadable
+    image URL - no point queuing those for download at all."""
+    parsed = urlparse(url)
+    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+
+
 def _extract_images(elem, base_url: str, skip_excluded: bool = False) -> list:
-    urls = []
+    """Returns a list of {"url": ..., "hint": ...} dicts - hint is the image's
+    own alt/title text (when present), used later to steer the AI toward
+    describing what that specific picture actually shows rather than always
+    repeating the page's overall product name."""
+    entries = []
     seen = set()
     for img in elem.iter("img"):
         if skip_excluded and _has_excluded_ancestor(img):
@@ -207,8 +232,9 @@ def _extract_images(elem, base_url: str, skip_excluded: bool = False) -> list:
         full_url = urljoin(base_url, chosen) if base_url else chosen
         if full_url not in seen:
             seen.add(full_url)
-            urls.append(full_url)
-    return urls
+            hint = (img.get("alt") or img.get("title") or "").strip()
+            entries.append({"url": full_url, "hint": hint})
+    return entries
 
 
 def _looks_like_product_container(elem) -> bool:
@@ -268,6 +294,59 @@ def _detect_html_encoding(file_path: str) -> str:
     return "utf-8"
 
 
+_META_IMAGE_KEYS = ("og:image", "og:image:url", "og:image:secure_url", "twitter:image", "twitter:image:src")
+
+
+def _extract_meta_image_candidates(root, base_url: str) -> list:
+    """Reads og:image/twitter:image meta tags - near-universal, reliable
+    sources for the main product photo. Used as a recovery path when a
+    browser's "Save Complete Webpage" export rewrote every real <img src>
+    into a local "..._files" file that can no longer be downloaded. Multiple
+    tags often point at different cache/size renditions of the same photo on
+    the live server (e.g. Magento's hashed image-cache directories), and any
+    single one of those can go stale/404 independently - collecting them all
+    lets the download step fall back through the list instead of trusting
+    just one."""
+    candidates = []
+    for meta in root.iter("meta"):
+        key = (meta.get("property") or meta.get("name") or "").strip().lower()
+        if key in _META_IMAGE_KEYS:
+            content = (meta.get("content") or "").strip()
+            if content and not content.startswith("data:"):
+                url = urljoin(base_url, content) if base_url else content
+                if url not in candidates:
+                    candidates.append(url)
+    return candidates
+
+
+def _extract_jsonld_product_images(root, base_url: str) -> list:
+    """Reads Product structured data (JSON-LD, <script type="application/ld+json">)
+    for its "image" field(s) - same recovery rationale as _extract_og_image."""
+    urls = []
+    for script in root.iter("script"):
+        if (script.get("type") or "").strip().lower() != "application/ld+json":
+            continue
+        raw = script.text or ""
+        if not raw.strip():
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        for entry in (data if isinstance(data, list) else [data]):
+            if not isinstance(entry, dict):
+                continue
+            entry_type = entry.get("@type")
+            types = entry_type if isinstance(entry_type, list) else [entry_type]
+            if not any(isinstance(t, str) and t.lower() == "product" for t in types):
+                continue
+            image = entry.get("image")
+            for img_url in (image if isinstance(image, list) else [image]):
+                if isinstance(img_url, str) and img_url.strip() and not img_url.startswith("data:"):
+                    urls.append(urljoin(base_url, img_url) if base_url else img_url)
+    return urls
+
+
 def _extract_single_product_fallback(file_path: str, base_url: str):
     """Used when no repeated product containers were found - treats the whole
     document as a single product page (typical single-product export)."""
@@ -280,7 +359,30 @@ def _extract_single_product_fallback(file_path: str, base_url: str):
     if root is None:
         return
 
-    images = [u for u in _extract_images(root, base_url, skip_excluded=True) if not is_placeholder_image(u)]
+    img_entries = [
+        e for e in _extract_images(root, base_url, skip_excluded=True)
+        if _is_fetchable_url(e["url"]) and not is_placeholder_image(e["url"])
+    ]
+
+    # Recovery path for browser-saved "Complete Webpage" exports, where every
+    # <img src> was rewritten to a local file and none of img_entries survived
+    # the fetchable-URL filter above (or even if some did, the canonical
+    # og:image/JSON-LD photo is still worth adding as the primary image).
+    # Every candidate found (meta tags + JSON-LD) is kept as one image entry
+    # with a fallback chain, so a single stale/404 cache URL doesn't sink it.
+    seen_urls = {e["url"] for e in img_entries}
+    candidates = _extract_meta_image_candidates(root, base_url) + _extract_jsonld_product_images(root, base_url)
+
+    recovered_urls = []
+    for url in candidates:
+        if url and _is_fetchable_url(url) and url not in seen_urls and url not in recovered_urls and not is_placeholder_image(url):
+            recovered_urls.append(url)
+
+    recovered = []
+    if recovered_urls:
+        recovered.append({"url": recovered_urls[0], "hint": "", "fallback_urls": recovered_urls[1:]})
+
+    images = recovered + img_entries
     if not images:
         return
 
@@ -327,7 +429,10 @@ def extract_products_from_html(file_path: str, base_url: str = ""):
 
         if _looks_like_product_container(elem):
             if not _has_excluded_ancestor(elem):
-                images = [u for u in _extract_images(elem, base_url) if not is_placeholder_image(u)]
+                images = [
+                    e for e in _extract_images(elem, base_url)
+                    if _is_fetchable_url(e["url"]) and not is_placeholder_image(e["url"])
+                ]
                 if images:
                     products_found = True
                     title = _first_match_text(elem, TITLE_RE) or page_h1
@@ -569,8 +674,12 @@ ALT_TEXT_SYSTEM_PROMPT = (
 ALT_TEXT_PROMPT_TEMPLATE = (
     "Jesteś ekspertem SEO e-commerce. Przeanalizuj to zdjęcie produktu oraz poniższy "
     "kontekst ze strony produktowej: {context}. Wygeneruj zwięzły, naturalny tekst ALT "
-    "(4-8 słów) po polsku. Uwzględnij dokładną markę i model wyciągnięty z kontekstu oraz "
-    "to, co faktycznie widać na zdjęciu. Nie używaj słów 'zdjęcie przedstawia' ani 'obrazek'."
+    "(4-8 słów) po polsku. OPISZ PRZEDE WSZYSTKIM to, co faktycznie widać na zdjęciu - "
+    "jeśli kontekst zaczyna się od 'Na zdjęciu widać: ...', to właśnie to jest tematem "
+    "zdjęcia (np. konkretny akcesorium/część, a nie sam produkt główny) i od tego zacznij "
+    "opis. Markę i nazwę produktu dodaj tylko jako uzupełnienie, gdy ma to sens - NIE każdy "
+    "ALT musi zaczynać się od pełnej nazwy produktu głównego. Nie używaj słów 'zdjęcie "
+    "przedstawia' ani 'obrazek'."
 )
 
 # Shared "cooldown" between worker threads so a burst of 429s doesn't cause every
@@ -668,7 +777,7 @@ def generate_alt_via_openai(image_path: str, context: str) -> str:
     return alt.strip('"').strip("'").strip()
 
 
-def process_single_image(image_url: str, context: str, job_dir: str) -> dict:
+def process_single_image(image_url: str, context: str, job_dir: str, fallback_urls: list = None) -> dict:
     dims = fetch_image_dimensions_fast(image_url)
     if dims is not None and (dims[0] < MIN_IMAGE_DIMENSION or dims[1] < MIN_IMAGE_DIMENSION):
         return {
@@ -680,7 +789,23 @@ def process_single_image(image_url: str, context: str, job_dir: str) -> dict:
             "image_data": "",
         }
 
-    local_path = download_image_from_url(image_url, job_dir)
+    # Some candidates (e.g. a stale Magento image-cache rendition recovered
+    # from og:image/JSON-LD) can 404 independently of one another even though
+    # they're meant to be the same photo - try each in turn before giving up.
+    candidate_urls = [image_url] + [u for u in (fallback_urls or []) if u != image_url]
+    local_path = None
+    used_url = image_url
+    last_error = None
+    for candidate_url in candidate_urls:
+        try:
+            local_path = download_image_from_url(candidate_url, job_dir)
+            used_url = candidate_url
+            break
+        except Exception as e:
+            last_error = e
+    if local_path is None:
+        raise last_error if last_error is not None else RuntimeError("Nie udało się pobrać obrazu.")
+
     compressed_path = compress_image(local_path)
     alt_text = generate_alt_via_openai(compressed_path, context)
 
@@ -689,7 +814,7 @@ def process_single_image(image_url: str, context: str, job_dir: str) -> dict:
         encoded_image = base64.b64encode(f.read()).decode("utf-8")
 
     return {
-        "image_url": image_url,
+        "image_url": used_url,
         "context": context,
         "alt": alt_text,
         "skipped": False,
@@ -724,8 +849,11 @@ def background_worker(task_id: str, html_path: str, base_url: str, job_dir: str)
         truncated = False
         try:
             for product in extract_products_from_html(html_path, base_url):
-                for image_url in product["images"]:
-                    tasks.append((image_url, product["context"], product["label"], product["id"]))
+                for image_entry in product["images"]:
+                    tasks.append((
+                        image_entry["url"], product["context"], image_entry.get("hint", ""),
+                        product["label"], product["id"], image_entry.get("fallback_urls", []),
+                    ))
                     if len(tasks) >= MAX_IMAGE_TASKS_PER_BATCH:
                         truncated = True
                         break
@@ -763,18 +891,19 @@ def background_worker(task_id: str, html_path: str, base_url: str, job_dir: str)
             if stop_event.is_set():
                 return
 
-            image_url, context, label, page_id = item
+            image_url, page_context, image_hint, label, page_id, fallback_urls = item
             is_error = False
             error_detail = None
+            ai_context = build_image_ai_context(page_context, image_hint)
 
             try:
-                res = process_single_image(image_url, context, job_dir)
+                res = process_single_image(image_url, ai_context, job_dir, fallback_urls=fallback_urls)
             except Exception as e:
                 is_error = True
                 error_detail = str(e)
                 res = {
                     "image_url": image_url,
-                    "context": context,
+                    "context": ai_context,
                     "alt": f"Błąd przetwarzania: {error_detail}",
                     "skipped": False,
                     "skip_reason": None,
@@ -782,10 +911,12 @@ def background_worker(task_id: str, html_path: str, base_url: str, job_dir: str)
                 }
 
             # Page/product identity + filename - used to regroup flat results
-            # back into "one row per page" for the CSV export.
+            # back into "one row per page" for the CSV export. Derived from
+            # whichever URL actually succeeded (res["image_url"]), which may
+            # differ from the original candidate if a fallback URL was used.
             res["page"] = label
             res["page_id"] = page_id
-            res["image_name"] = _friendly_name_from_url(image_url)
+            res["image_name"] = _friendly_name_from_url(res.get("image_url") or image_url)
 
             with JOBS_LOCK:
                 if task_id not in JOBS or stop_event.is_set():
