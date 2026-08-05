@@ -28,29 +28,27 @@
         </div>
       </div>
       <span class="hidden sm:inline-block text-[10px] font-bold uppercase tracking-widest text-black bg-[#00E676] px-3 py-1 rounded-md">
-        HTML &rarr; AI &rarr; ALT
+        URL &rarr; AI &rarr; ALT
       </span>
     </div>
   </header>
 
   <main class="max-w-6xl mx-auto px-6 py-10 space-y-8">
 
-    <!-- Upload card -->
+    <!-- Input card -->
     <section class="bg-white border-2 border-neutral-900 rounded-xl p-6 sm:p-8 shadow-sm">
-      <h2 class="font-black uppercase text-lg tracking-wide mb-1">1. Wgraj plik HTML albo podaj adres strony</h2>
-      <p class="text-sm text-neutral-500 mb-6">Wyeksportowana strona produktowa lub listing (obsługiwane pliki do {{ max_content_mb }} MB) — albo bezpośredni link do strony sklepu.</p>
+      <h2 class="font-black uppercase text-lg tracking-wide mb-1">1. Wklej listę adresów URL</h2>
+      <p class="text-sm text-neutral-500 mb-6">
+        Jeden adres na linijkę (maks. {{ max_urls_per_batch }}). Link do <code class="bg-neutral-100 px-1 rounded">sitemap.xml</code>
+        zostanie automatycznie rozwinięty na wszystkie podstrony, jakie zawiera.
+      </p>
 
       <form id="upload-form">
-        <label id="dropzone"
-               for="html_file"
-               class="flex flex-col items-center justify-center gap-2 border-2 border-dashed border-neutral-300 rounded-lg py-14 px-6 cursor-pointer transition-colors hover:border-[#00E676] hover:bg-emerald-50 text-center">
-          <svg class="w-10 h-10 text-neutral-400" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
-          </svg>
-          <span id="dropzone-text" class="font-bold text-neutral-700">Przeciągnij plik .html tutaj albo <span class="text-[#00C853] underline">wybierz z dysku</span></span>
-          <span class="text-xs text-neutral-400">Akceptowane formaty: .html, .htm</span>
-          <input id="html_file" name="html_file" type="file" accept=".html,.htm" class="hidden">
+        <label for="urls_text" class="block text-xs font-bold uppercase tracking-wide text-neutral-600 mb-1">
+          Adresy URL
         </label>
+        <textarea id="urls_text" name="urls_text" rows="7" placeholder="https://sklep.pl/produkt/nazwa-produktu-1&#10;https://sklep.pl/produkt/nazwa-produktu-2&#10;https://sklep.pl/sitemap.xml"
+                  class="w-full border border-neutral-300 rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:border-[#00E676] focus:ring-2 focus:ring-emerald-100"></textarea>
 
         <div class="flex items-center gap-3 my-5">
           <span class="flex-1 h-px bg-neutral-200"></span>
@@ -58,23 +56,16 @@
           <span class="flex-1 h-px bg-neutral-200"></span>
         </div>
 
-        <div>
-          <label for="page_url" class="block text-xs font-bold uppercase tracking-wide text-neutral-600 mb-1">
-            Adres URL strony
-          </label>
-          <input id="page_url" name="page_url" type="text" placeholder="https://sklep.pl/produkt/nazwa-produktu"
-                 class="w-full border border-neutral-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-[#00E676] focus:ring-2 focus:ring-emerald-100">
-          <p class="text-xs text-neutral-400 mt-1">Aplikacja sama pobierze i przeanalizuje stronę (tylko http/https). Wypełnij to pole zamiast wgrywania pliku.</p>
-        </div>
-
-        <div class="mt-5">
-          <label for="base_url" class="block text-xs font-bold uppercase tracking-wide text-neutral-600 mb-1">
-            Adres bazowy (opcjonalnie, tylko dla wgranego pliku)
-          </label>
-          <input id="base_url" name="base_url" type="text" placeholder="https://sklep.pl/"
-                 class="w-full border border-neutral-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-[#00E676] focus:ring-2 focus:ring-emerald-100">
-          <p class="text-xs text-neutral-400 mt-1">Używany do rozwiązywania względnych adresów URL grafik (np. /img/produkt.jpg) we wgranym pliku.</p>
-        </div>
+        <label id="dropzone"
+               for="urls_file"
+               class="flex flex-col items-center justify-center gap-2 border-2 border-dashed border-neutral-300 rounded-lg py-10 px-6 cursor-pointer transition-colors hover:border-[#00E676] hover:bg-emerald-50 text-center">
+          <svg class="w-8 h-8 text-neutral-400" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+          </svg>
+          <span id="dropzone-text" class="font-bold text-neutral-700">Przeciągnij plik .txt/.csv z linkami tutaj albo <span class="text-[#00C853] underline">wybierz z dysku</span></span>
+          <span class="text-xs text-neutral-400">Akceptowane formaty: .txt, .csv</span>
+          <input id="urls_file" name="urls_file" type="file" accept=".txt,.csv" class="hidden">
+        </label>
 
         <button id="submit-btn" type="submit"
                 class="mt-6 w-full sm:w-auto bg-[#00E676] hover:bg-[#00C853] disabled:bg-neutral-300 disabled:cursor-not-allowed text-black font-black uppercase tracking-wide rounded-md py-3 px-8 transition-colors">
@@ -89,7 +80,7 @@
     <section id="progress-section" class="hidden bg-white border-2 border-neutral-900 rounded-xl p-6 sm:p-8 shadow-sm">
       <div class="flex items-center justify-between mb-3">
         <h2 class="font-black uppercase text-lg tracking-wide">2. Przetwarzanie</h2>
-        <span id="progress-status" class="text-xs font-bold uppercase tracking-wide text-neutral-500">Parsowanie pliku HTML...</span>
+        <span id="progress-status" class="text-xs font-bold uppercase tracking-wide text-neutral-500">Przygotowywanie listy adresów...</span>
       </div>
       <div class="w-full h-3 bg-neutral-200 rounded-full overflow-hidden">
         <div id="progress-bar" class="h-full bg-[#00E676] transition-all duration-300" style="width: 0%"></div>
@@ -115,7 +106,8 @@
           <thead class="bg-black text-white uppercase text-xs tracking-wide">
             <tr>
               <th class="text-left px-4 py-3 w-28">Podgląd</th>
-              <th class="text-left px-4 py-3">Wyciągnięty kontekst SEM</th>
+              <th class="text-left px-4 py-3">URL Strony</th>
+              <th class="text-left px-4 py-3">Kontekst</th>
               <th class="text-left px-4 py-3">Wygenerowany ALT</th>
             </tr>
           </thead>
@@ -134,9 +126,8 @@
 (function () {
   const dropzone = document.getElementById('dropzone');
   const dropzoneText = document.getElementById('dropzone-text');
-  const fileInput = document.getElementById('html_file');
-  const baseUrlInput = document.getElementById('base_url');
-  const pageUrlInput = document.getElementById('page_url');
+  const fileInput = document.getElementById('urls_file');
+  const urlsTextInput = document.getElementById('urls_text');
   const form = document.getElementById('upload-form');
   const submitBtn = document.getElementById('submit-btn');
   const errorBanner = document.getElementById('error-banner');
@@ -180,23 +171,23 @@
     dropzone.classList.remove('drop-active');
     if (e.dataTransfer.files.length) {
       fileInput.files = e.dataTransfer.files;
-      pageUrlInput.value = '';
+      urlsTextInput.value = '';
       updateDropzoneLabel();
     }
   });
 
   fileInput.addEventListener('change', () => {
     if (fileInput.files.length) {
-      pageUrlInput.value = '';
+      urlsTextInput.value = '';
     }
     updateDropzoneLabel();
   });
 
-  // The two inputs are mutually exclusive - typing a URL clears any previously
-  // selected file (which a browser keeps around across submits), so the app
-  // never silently reuses a stale file instead of the URL the user just typed.
-  pageUrlInput.addEventListener('input', () => {
-    if (pageUrlInput.value.trim() && fileInput.files.length) {
+  // The two inputs are mutually exclusive - typing a URL list clears any
+  // previously selected file (which a browser keeps around across submits),
+  // so the app never silently reuses a stale file instead of freshly typed URLs.
+  urlsTextInput.addEventListener('input', () => {
+    if (urlsTextInput.value.trim() && fileInput.files.length) {
       fileInput.value = '';
       updateDropzoneLabel();
     }
@@ -206,7 +197,7 @@
     if (fileInput.files.length) {
       dropzoneText.textContent = fileInput.files[0].name;
     } else {
-      dropzoneText.innerHTML = 'Przeciągnij plik .html tutaj albo <span class="text-[#00C853] underline">wybierz z dysku</span>';
+      dropzoneText.innerHTML = 'Przeciągnij plik .txt/.csv z linkami tutaj albo <span class="text-[#00C853] underline">wybierz z dysku</span>';
     }
   }
 
@@ -224,31 +215,23 @@
     clearError();
 
     const hasFile = fileInput.files.length > 0;
-    const pageUrl = pageUrlInput.value.trim();
+    const urlsText = urlsTextInput.value.trim();
 
-    if (!hasFile && !pageUrl) {
-      showError('Wybierz plik .html albo podaj adres URL strony przed wysłaniem.');
-      return;
-    }
-
-    if (!hasFile && !/^https?:\/\//i.test(pageUrl)) {
-      showError('Adres URL strony musi zaczynać się od http:// lub https://.');
+    if (!hasFile && !urlsText) {
+      showError('Wklej listę adresów URL albo wgraj plik .txt/.csv z linkami.');
       return;
     }
 
     resetUI();
     submitBtn.disabled = true;
     progressSection.classList.remove('hidden');
-    progressStatus.textContent = hasFile ? 'Wysyłanie pliku...' : 'Pobieranie strony...';
+    progressStatus.textContent = 'Przygotowywanie listy adresów...';
 
     const formData = new FormData();
     if (hasFile) {
-      formData.append('html_file', fileInput.files[0]);
-      if (baseUrlInput.value.trim()) {
-        formData.append('base_url', baseUrlInput.value.trim());
-      }
+      formData.append('urls_file', fileInput.files[0]);
     } else {
-      formData.append('page_url', pageUrl);
+      formData.append('urls_text', urlsText);
     }
 
     try {
@@ -256,7 +239,7 @@
       const data = await resp.json();
 
       if (!resp.ok) {
-        showError(data.error || 'Wystąpił błąd podczas wysyłania pliku.');
+        showError(data.error || 'Wystąpił błąd podczas wysyłania danych.');
         submitBtn.disabled = false;
         progressSection.classList.add('hidden');
         return;
@@ -322,14 +305,14 @@
     progressBar.style.width = pct + '%';
 
     if (job.status === 'parsing') {
-      progressStatus.textContent = 'Parsowanie pliku HTML...';
-      progressText.textContent = 'Wyszukiwanie produktów i grafik w strukturze strony...';
+      progressStatus.textContent = 'Przygotowywanie listy adresów...';
+      progressText.textContent = 'Wczytywanie adresów (rozwijanie sitemap, jeśli podano)...';
     } else if (job.status === 'processing') {
       progressStatus.textContent = 'Analiza AI w toku';
-      progressText.textContent = `Pobieranie i analiza AI (${processed} z ${total})...`;
+      progressText.textContent = `Przetworzono ${processed} z ${total} podstron...`;
     } else if (job.status === 'completed') {
       progressStatus.textContent = 'Zakończono';
-      progressText.textContent = `Gotowe - przetworzono ${processed} z ${total} obrazów.`;
+      progressText.textContent = `Gotowe - przetworzono ${processed} z ${total} podstron.`;
     } else if (job.status === 'stopped_error') {
       progressStatus.textContent = 'Zatrzymano';
     } else if (job.status === 'error') {
@@ -364,6 +347,12 @@
         previewCell.innerHTML = `<div class="w-16 h-16 rounded border border-neutral-300 bg-neutral-100 flex items-center justify-center text-neutral-400 text-xs text-center px-1">brak podglądu</div>`;
       }
 
+      const pageCell = document.createElement('td');
+      pageCell.className = 'px-4 py-3 text-xs max-w-xs break-all';
+      pageCell.innerHTML = r.page_url
+        ? `<a href="${escapeHtml(r.page_url)}" target="_blank" rel="noopener" class="text-neutral-600 underline hover:text-[#00C853]">${escapeHtml(r.page_url)}</a>`
+        : '';
+
       const contextCell = document.createElement('td');
       contextCell.className = 'px-4 py-3 text-xs text-neutral-600 max-w-xs';
       contextCell.textContent = r.context || '';
@@ -377,6 +366,7 @@
       }
 
       tr.appendChild(previewCell);
+      tr.appendChild(pageCell);
       tr.appendChild(contextCell);
       tr.appendChild(altCell);
       resultsBody.appendChild(tr);
@@ -387,31 +377,10 @@
   exportBtn.addEventListener('click', () => {
     if (!currentResults.length) return;
 
-    // Regroup the flat per-image results back into one row per page/product,
-    // preserving the order in which each page's images were first seen.
-    const groups = [];
-    const groupsByKey = new Map();
-
+    const rows = [['URL Strony', 'URL Obrazka', 'Kontekst Produktu', 'Wygenerowany ALT']];
     currentResults.forEach(r => {
-      const key = r.page_id || r.page || 'produkt';
-      let group = groupsByKey.get(key);
-      if (!group) {
-        group = { page: r.page || '', images: [], alts: [] };
-        groupsByKey.set(key, group);
-        groups.push(group);
-      }
-      group.images.push(r.image_name || r.image_url || '');
-      group.alts.push(r.skipped ? (r.skip_reason || 'Pominięto') : (r.alt || ''));
-    });
-
-    const rows = [['Strona', 'Nazwa grafiki głównej', 'Grafiki na stronie', 'Atrybuty ALT']];
-    groups.forEach(g => {
-      rows.push([
-        g.page,
-        g.images[0] || '',
-        g.images.join(', '),
-        g.alts.join(', '),
-      ]);
+      const alt = r.skipped ? (r.skip_reason || '') : (r.alt || '');
+      rows.push([r.page_url || '', r.image_url || '', r.context || '', alt]);
     });
 
     const csvBody = rows

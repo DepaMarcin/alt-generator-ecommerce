@@ -2,5 +2,4 @@ Flask
 requests
 openai
 Pillow
-lxml
 python-dotenv

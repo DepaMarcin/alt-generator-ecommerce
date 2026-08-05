@@ -1,9 +1,6 @@
 import os
 import re
 import io
-import csv
-import json
-import random
 import uuid
 import ipaddress
 import socket
@@ -12,28 +9,28 @@ import time
 import mimetypes
 import base64
 import shutil
-import requests
+import random
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template, request, jsonify
 from dotenv import load_dotenv
 from openai import OpenAI, RateLimitError
 from PIL import Image
-from lxml import etree
+import requests
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# Upload limits - HTML exports can be large (up to ~3 GB), but Werkzeug always
-# spools multipart file parts to a disk-backed temp file, so RAM usage stays low
-# regardless of this cap; it only bounds total request size.
-MAX_CONTENT_LENGTH_MB = 3072
+# The upload is now just a list of URLs (pasted text or a small .txt/.csv) -
+# no more multi-gigabyte HTML dumps, so a generous-but-sane cap is enough.
+MAX_CONTENT_LENGTH_MB = 16
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH_MB * 1024 * 1024
 JOB_MAX_AGE_SECONDS = 3600      # Job retention time in memory (1h)
-MAX_WORKERS = 5                  # Number of parallel connections to OpenAI
+MAX_WORKERS = 5                  # Number of parallel connections (page fetch + OpenAI)
 
-# In-memory job store + thread lock
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
@@ -41,420 +38,23 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 TMP_UPLOADS_DIR = os.path.join(PROJECT_DIR, "tmp_uploads")
 os.makedirs(TMP_UPLOADS_DIR, exist_ok=True)
 
-CONSECUTIVE_ERROR_LIMIT = 5              # Isolated transient errors shouldn't abort the whole batch
-MAX_IMAGE_TASKS_PER_BATCH = 500          # Safety cap on how many images one HTML file can queue for OpenAI
-MIN_IMAGE_DIMENSION = 150                # px - images smaller than this on either side are treated as icons
-CONTEXT_MAX_CHARS = 500                  # Cap on the context string sent to OpenAI (controls token usage)
+CONSECUTIVE_ERROR_LIMIT = 5          # Isolated transient errors shouldn't abort the whole batch
+MAX_URLS_PER_BATCH = 1000            # Safety cap on how many page URLs one batch can queue (after sitemap expansion)
+MAX_SITEMAP_URLS_PER_FILE = 2000     # Cap per individual sitemap/sitemap-index fetch
+MAX_SITEMAP_DEPTH = 3                # How many levels of nested sitemap indexes to follow
+MIN_IMAGE_DIMENSION = 150            # px - images smaller than this on either side are treated as icons
+PAGE_FETCH_TIMEOUT_SECONDS = 20
+MAX_PAGE_FETCH_BYTES = 15 * 1024 * 1024   # a product page's HTML/sitemap XML shouldn't exceed this
+MAX_URL_REDIRECTS = 5
 
 
 # ---------------------------------------------------------------------------
-# SEM helper regexes
-# ---------------------------------------------------------------------------
-
-PLACEHOLDER_IMAGE_RE = re.compile(
-    r'(brak[-_]?zdj[ea]ci?a|placeholder|coming[-_]?soon|wkr[oó]tce|no[-_]?image|noimage|'
-    r'no[-_]?photo|blank|niedostepn[ae]|default[-_]?(image|product)|zastepcze)',
-    re.IGNORECASE,
-)
-
-PROMO_SPAM_RE = re.compile(
-    r'(darmowa\s+wysy[łl]ka|free\s+shipping|dostawa\s+gratis|rabat\s*-?\s*\d{1,3}\s*%|'
-    r'-\s?\d{1,3}\s?%|promocja!*|super\s*cena|najni[żz]sza\s*cena(?:\s*w\s*histori[i]?)?|'
-    r'\bgratis\b|wyprzeda[żz]|okazja!*|\bhit!*\b|nowo[śs][ćc]!*|bestseller!*)',
-    re.IGNORECASE,
-)
-
-CERT_RE = re.compile(
-    r'\b(EN\s?\d{3,5}(?:[-:]\d+)?|ECE\s?R\d{2,3}(?:\.\d+)?|OEKO-?TEX(?:\s?Standard\s?100)?|ISO\s?\d{4,5})\b',
-    re.IGNORECASE,
-)
-
-DIMENSION_WEIGHT_RE = re.compile(
-    r'\b(\d+(?:[.,]\d+)?\s?(?:kg|g|cm|mm|m|l|ml))\b'
-    r'|\b(\d{1,2}\s?-\s?\d{1,2}\s?lat|od\s?\d+\s?(?:kg|lat|miesi[ęe]cy)|\d{1,2}\s?m(?:ies)?\.?\s?-\s?\d{1,2}\s?lat)\b',
-    re.IGNORECASE,
-)
-
-PRODUCT_CONTAINER_RE = re.compile(
-    r'(product[-_]?(item|card|box|tile|listing|miniature|preview|grid-item)'
-    r'|produkt[-_]?(box|kafelek|karta|item|miniaturka)'
-    r'|offer[-_]?item|listing[-_]?item)',
-    re.IGNORECASE,
-)
-BREADCRUMB_RE = re.compile(r'breadcrumb|okruszk', re.IGNORECASE)
-BRAND_RE = re.compile(r'\b(brand|producer|manufacturer|marka|producent)\b', re.IGNORECASE)
-TITLE_RE = re.compile(
-    r'(product[-_]?(name|title)|nazwa[-_]?produktu|product-info-name)',
-    re.IGNORECASE,
-)
-
-# "Related/upsell/cross-sell" widgets (e.g. "Może Ci się spodobać") on real
-# product pages reuse product-card-like markup for their recommendation tiles -
-# those must never be mistaken for the products actually being alt-tagged.
-EXCLUDED_CONTAINER_RE = re.compile(
-    r'(related|cross-?sell|up-?sell|recommend|carousel|swiper|slider|'
-    r'you-?may-?also-?like|similar[-_]?products?|polecane|podobne)',
-    re.IGNORECASE,
-)
-
-IMG_SRC_ATTR_PRIORITY = ("data-lazy-src", "data-src", "data-original", "src")
-
-
-def is_placeholder_image(url: str) -> bool:
-    """Detects "no photo yet" placeholder images so they're skipped instead of
-    being sent to the AI (saves API calls and avoids nonsense ALT text)."""
-    return bool(PLACEHOLDER_IMAGE_RE.search(url))
-
-
-def clean_product_title_for_context(text: str) -> str:
-    """Strips promotional spam (shipping/discount banners) out of raw scraped
-    text so it doesn't pollute the context sent to the AI model."""
-    if not text:
-        return ""
-    cleaned = PROMO_SPAM_RE.sub(" ", text)
-    return re.sub(r'\s+', ' ', cleaned).strip()
-
-
-def extract_product_facts(text: str) -> dict:
-    """Extracts hard technical facts (certifications, dimensions/weight/age
-    ranges) from a block of specification text, deduped and order-preserving."""
-    if not text:
-        return {"certificates": [], "dimensions": []}
-
-    certs = []
-    for m in CERT_RE.finditer(text):
-        val = m.group(0).strip()
-        if val not in certs:
-            certs.append(val)
-
-    dims = []
-    for m in DIMENSION_WEIGHT_RE.finditer(text):
-        val = (m.group(1) or m.group(2) or "").strip()
-        if val and val not in dims:
-            dims.append(val)
-
-    return {"certificates": certs[:8], "dimensions": dims[:8]}
-
-
-def build_product_context(title: str, brand: str, breadcrumbs: str, specs_text: str) -> str:
-    """Combines the extracted signals into one compact context string used
-    both for the AI prompt and displayed in the results table."""
-    clean_title = clean_product_title_for_context(title)
-    clean_specs = clean_product_title_for_context(specs_text)
-    facts = extract_product_facts(clean_specs)
-
-    parts = []
-    if brand:
-        parts.append(f"Marka: {brand.strip()}")
-    if clean_title:
-        parts.append(f"Produkt: {clean_title.strip()}")
-    if breadcrumbs:
-        parts.append(f"Kategoria: {breadcrumbs.strip()}")
-    if facts["certificates"]:
-        parts.append("Certyfikaty: " + ", ".join(facts["certificates"]))
-    if facts["dimensions"]:
-        parts.append("Parametry: " + ", ".join(facts["dimensions"]))
-
-    context = " | ".join(parts)
-    return context[:CONTEXT_MAX_CHARS] if context else "Brak dodatkowego kontekstu tekstowego."
-
-
-def build_image_ai_context(page_context: str, image_hint: str) -> str:
-    """Combines the page-level product context with one specific image's own
-    hint (its alt/title text). The hint - what that picture actually shows,
-    e.g. an accessory like "narty do wózka" - takes priority over the page's
-    overall product name so the AI doesn't repeat the same product name on
-    every single image regardless of what's actually depicted."""
-    hint = clean_product_title_for_context(image_hint)
-    if hint and hint.lower() not in page_context.lower():
-        return f"Na zdjęciu widać: {hint} | {page_context}"[:CONTEXT_MAX_CHARS]
-    return page_context
-
-
-# ---------------------------------------------------------------------------
-# Streaming HTML parsing (lxml.etree.iterparse) - keeps memory bounded on very
-# large exported HTML files by clearing each product block once it's been read.
-# ---------------------------------------------------------------------------
-
-def _text_of(elem) -> str:
-    return " ".join(t.strip() for t in elem.itertext() if t and t.strip())
-
-
-def _elem_classes_and_id(elem) -> str:
-    return f"{elem.get('class', '')} {elem.get('id', '')}"
-
-
-def _first_match_text(elem, class_re) -> str:
-    for e in elem.iter():
-        tag = e.tag
-        if not isinstance(tag, str):
-            continue
-        if class_re.search(_elem_classes_and_id(e)):
-            txt = _text_of(e)
-            if txt:
-                return txt
-    return ""
-
-
-def _is_fetchable_url(url: str) -> bool:
-    """False for the local "./xxx_files/image.jpg" references a browser's
-    "Save Complete Webpage" leaves behind instead of the real, downloadable
-    image URL - no point queuing those for download at all."""
-    parsed = urlparse(url)
-    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
-
-
-def _extract_images(elem, base_url: str, skip_excluded: bool = False) -> list:
-    """Returns a list of {"url": ..., "hint": ...} dicts - hint is the image's
-    own alt/title text (when present), used later to steer the AI toward
-    describing what that specific picture actually shows rather than always
-    repeating the page's overall product name."""
-    entries = []
-    seen = set()
-    for img in elem.iter("img"):
-        if skip_excluded and _has_excluded_ancestor(img):
-            continue
-        chosen = None
-        for attr in IMG_SRC_ATTR_PRIORITY:
-            v = img.get(attr)
-            if v and v.strip() and not v.strip().startswith("data:"):
-                chosen = v.strip()
-                break
-        if not chosen:
-            srcset = img.get("srcset") or img.get("data-srcset")
-            if srcset:
-                first = srcset.split(",")[0].strip().split(" ")[0]
-                if first and not first.startswith("data:"):
-                    chosen = first
-        if not chosen:
-            continue
-
-        full_url = urljoin(base_url, chosen) if base_url else chosen
-        if full_url not in seen:
-            seen.add(full_url)
-            hint = (img.get("alt") or img.get("title") or "").strip()
-            entries.append({"url": full_url, "hint": hint})
-    return entries
-
-
-def _looks_like_product_container(elem) -> bool:
-    tag = elem.tag
-    if not isinstance(tag, str) or tag not in ("div", "li", "article", "section"):
-        return False
-    if not PRODUCT_CONTAINER_RE.search(_elem_classes_and_id(elem)):
-        return False
-    return elem.find(".//img") is not None
-
-
-def _has_excluded_ancestor(elem) -> bool:
-    """True if elem sits inside a related/upsell/cross-sell/carousel widget -
-    those reuse product-card-like markup for recommendation tiles, which are
-    never the actual product(s) being alt-tagged on the page."""
-    parent = elem.getparent()
-    while parent is not None:
-        tag = parent.tag
-        if isinstance(tag, str) and EXCLUDED_CONTAINER_RE.search(_elem_classes_and_id(parent)):
-            return True
-        parent = parent.getparent()
-    return False
-
-
-def _clear_element(elem):
-    """Frees a processed subtree and every sibling that came before it, which
-    is what keeps memory bounded when iterparse-ing a huge listing page."""
-    elem.clear()
-    parent = elem.getparent()
-    if parent is None:
-        return
-    while elem.getprevious() is not None:
-        del parent[0]
-
-
-_META_CHARSET_RE = re.compile(rb'charset=["\']?\s*([a-zA-Z0-9_\-]+)', re.IGNORECASE)
-
-
-def _detect_html_encoding(file_path: str) -> str:
-    """Peeks at the first few KB for a declared <meta charset>. Defaults to
-    UTF-8 (the overwhelming majority of modern e-commerce exports) instead of
-    trusting libxml2's heuristic guess, which can silently mis-decode accented
-    characters (e.g. Polish diacritics) when no charset is declared."""
-    try:
-        with open(file_path, "rb") as f:
-            head = f.read(4096)
-        match = _META_CHARSET_RE.search(head)
-        if match:
-            candidate = match.group(1).decode("ascii", errors="ignore").strip()
-            try:
-                "test".encode(candidate)
-                return candidate
-            except LookupError:
-                pass
-    except Exception:
-        pass
-    return "utf-8"
-
-
-_META_IMAGE_KEYS = ("og:image", "og:image:url", "og:image:secure_url", "twitter:image", "twitter:image:src")
-
-
-def _extract_meta_image_candidates(root, base_url: str) -> list:
-    """Reads og:image/twitter:image meta tags - near-universal, reliable
-    sources for the main product photo. Used as a recovery path when a
-    browser's "Save Complete Webpage" export rewrote every real <img src>
-    into a local "..._files" file that can no longer be downloaded. Multiple
-    tags often point at different cache/size renditions of the same photo on
-    the live server (e.g. Magento's hashed image-cache directories), and any
-    single one of those can go stale/404 independently - collecting them all
-    lets the download step fall back through the list instead of trusting
-    just one."""
-    candidates = []
-    for meta in root.iter("meta"):
-        key = (meta.get("property") or meta.get("name") or "").strip().lower()
-        if key in _META_IMAGE_KEYS:
-            content = (meta.get("content") or "").strip()
-            if content and not content.startswith("data:"):
-                url = urljoin(base_url, content) if base_url else content
-                if url not in candidates:
-                    candidates.append(url)
-    return candidates
-
-
-def _extract_jsonld_product_images(root, base_url: str) -> list:
-    """Reads Product structured data (JSON-LD, <script type="application/ld+json">)
-    for its "image" field(s) - same recovery rationale as _extract_og_image."""
-    urls = []
-    for script in root.iter("script"):
-        if (script.get("type") or "").strip().lower() != "application/ld+json":
-            continue
-        raw = script.text or ""
-        if not raw.strip():
-            continue
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-        for entry in (data if isinstance(data, list) else [data]):
-            if not isinstance(entry, dict):
-                continue
-            entry_type = entry.get("@type")
-            types = entry_type if isinstance(entry_type, list) else [entry_type]
-            if not any(isinstance(t, str) and t.lower() == "product" for t in types):
-                continue
-            image = entry.get("image")
-            for img_url in (image if isinstance(image, list) else [image]):
-                if isinstance(img_url, str) and img_url.strip() and not img_url.startswith("data:"):
-                    urls.append(urljoin(base_url, img_url) if base_url else img_url)
-    return urls
-
-
-def _extract_single_product_fallback(file_path: str, base_url: str):
-    """Used when no repeated product containers were found - treats the whole
-    document as a single product page (typical single-product export)."""
-    try:
-        parser = etree.HTMLParser(recover=True, huge_tree=True, encoding=_detect_html_encoding(file_path))
-        tree = etree.parse(file_path, parser)
-    except Exception:
-        return
-    root = tree.getroot()
-    if root is None:
-        return
-
-    img_entries = [
-        e for e in _extract_images(root, base_url, skip_excluded=True)
-        if _is_fetchable_url(e["url"]) and not is_placeholder_image(e["url"])
-    ]
-
-    # Recovery path for browser-saved "Complete Webpage" exports, where every
-    # <img src> was rewritten to a local file and none of img_entries survived
-    # the fetchable-URL filter above (or even if some did, the canonical
-    # og:image/JSON-LD photo is still worth adding as the primary image).
-    # Every candidate found (meta tags + JSON-LD) is kept as one image entry
-    # with a fallback chain, so a single stale/404 cache URL doesn't sink it.
-    seen_urls = {e["url"] for e in img_entries}
-    candidates = _extract_meta_image_candidates(root, base_url) + _extract_jsonld_product_images(root, base_url)
-
-    recovered_urls = []
-    for url in candidates:
-        if url and _is_fetchable_url(url) and url not in seen_urls and url not in recovered_urls and not is_placeholder_image(url):
-            recovered_urls.append(url)
-
-    recovered = []
-    if recovered_urls:
-        recovered.append({"url": recovered_urls[0], "hint": "", "fallback_urls": recovered_urls[1:]})
-
-    images = recovered + img_entries
-    if not images:
-        return
-
-    h1_elem = root.find(".//h1")
-    h1_text = _text_of(h1_elem) if h1_elem is not None else ""
-    title = _first_match_text(root, TITLE_RE) or h1_text
-    brand = _first_match_text(root, BRAND_RE)
-    breadcrumbs = _first_match_text(root, BREADCRUMB_RE)
-    specs_text = _text_of(root)
-
-    context = build_product_context(title, brand, breadcrumbs, specs_text)
-    yield {"images": images, "context": context, "label": (title or brand or "Produkt")[:80], "id": uuid.uuid4().hex}
-
-
-def extract_products_from_html(file_path: str, base_url: str = ""):
-    """Streams the HTML file with lxml.etree.iterparse and yields one dict per
-    detected product block: {"images": [...], "context": "...", "label": "..."}.
-    Falls back to treating the whole document as a single product when no
-    repeated product containers are found (e.g. a single product page)."""
-    products_found = False
-    page_h1 = ""
-    page_breadcrumbs = ""
-
-    parse_context = etree.iterparse(
-        file_path, events=("end",), html=True, recover=True, huge_tree=True,
-        encoding=_detect_html_encoding(file_path),
-        tag=("div", "li", "article", "section", "h1", "nav", "ul", "ol"),
-    )
-
-    for _event, elem in parse_context:
-        tag = elem.tag
-        if not isinstance(tag, str):
-            continue
-
-        if tag == "h1" and not page_h1:
-            t = _text_of(elem)
-            if t:
-                page_h1 = t
-        elif tag in ("nav", "ul", "ol", "div") and not page_breadcrumbs:
-            if BREADCRUMB_RE.search(_elem_classes_and_id(elem)):
-                t = _text_of(elem)
-                if t:
-                    page_breadcrumbs = t
-
-        if _looks_like_product_container(elem):
-            if not _has_excluded_ancestor(elem):
-                images = [
-                    e for e in _extract_images(elem, base_url)
-                    if _is_fetchable_url(e["url"]) and not is_placeholder_image(e["url"])
-                ]
-                if images:
-                    products_found = True
-                    title = _first_match_text(elem, TITLE_RE) or page_h1
-                    brand = _first_match_text(elem, BRAND_RE)
-                    specs_text = _text_of(elem)
-                    context = build_product_context(title, brand, page_breadcrumbs, specs_text)
-                    yield {"images": images, "context": context, "label": (title or brand or "Produkt")[:80], "id": uuid.uuid4().hex}
-            _clear_element(elem)
-
-    del parse_context
-
-    if not products_found:
-        yield from _extract_single_product_fallback(file_path, base_url)
-
-
-# ---------------------------------------------------------------------------
-# SSRF guard + image download / dimension probing
+# SSRF guard + generic URL fetching
 # ---------------------------------------------------------------------------
 
 def _check_hostname_is_public(hostname: str):
     """Resolves hostname and rejects private/loopback/link-local/reserved IPs.
-    Basic SSRF guard - image URLs come from a user-supplied HTML file that
+    Basic SSRF guard - every URL processed here comes from user input and
     could point at internal/network-local addresses."""
     try:
         infos = socket.getaddrinfo(hostname, None)
@@ -464,6 +64,252 @@ def _check_hostname_is_public(hostname: str):
         ip = ipaddress.ip_address(info[4][0])
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
             raise ValueError("Adres URL wskazuje na prywatny/wewnętrzny adres i został zablokowany.")
+
+
+def _is_http_url(text: str) -> bool:
+    parsed = urlparse(text)
+    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+
+
+def _fetch_url_bytes(url: str, max_bytes: int) -> tuple:
+    """SSRF-guarded GET with manual redirect re-validation (each hop is
+    re-checked, same as the image downloader) and a byte-size cap. Returns
+    (content_bytes, final_url, content_type) - used for both page HTML and
+    sitemap XML fetches, which are always parsed in memory."""
+    session = requests.Session()
+    current_url = url
+
+    for _ in range(MAX_URL_REDIRECTS + 1):
+        parsed = urlparse(current_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("Nieprawidłowy URL (dozwolone są tylko linki http/https).")
+        _check_hostname_is_public(parsed.hostname)
+
+        response = session.get(
+            current_url, stream=True, timeout=PAGE_FETCH_TIMEOUT_SECONDS,
+            headers={"User-Agent": "AltTextGenerator/1.0"}, allow_redirects=False,
+        )
+        try:
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("Serwer zwrócił przekierowanie bez adresu docelowego.")
+                current_url = urljoin(current_url, location)
+                continue
+
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+
+            chunks = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=65536):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"Zawartość przekracza limit {max_bytes // (1024 * 1024)} MB.")
+                chunks.append(chunk)
+            return b"".join(chunks), current_url, content_type
+        finally:
+            response.close()
+
+    raise ValueError("Zbyt wiele przekierowań.")
+
+
+def fetch_page_html(url: str) -> tuple:
+    """Fetches a product page's live HTML. Returns (html_text, final_url)."""
+    content, final_url, content_type = _fetch_url_bytes(url, MAX_PAGE_FETCH_BYTES)
+    if content_type and not (content_type.startswith("text/html") or content_type.startswith("application/xhtml")):
+        raise ValueError(f"Adres nie zwraca strony HTML (Content-Type: {content_type}).")
+    try:
+        html_text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        html_text = content.decode("utf-8", errors="replace")
+    return html_text, final_url
+
+
+# ---------------------------------------------------------------------------
+# Meta-tag extraction (og:title/og:image) - deliberately minimal: we only
+# need a handful of <meta> tags and <title>, not a full DOM.
+# ---------------------------------------------------------------------------
+
+_META_IMAGE_KEYS = ("og:image", "og:image:url", "og:image:secure_url", "twitter:image", "twitter:image:src")
+
+
+class _MetaTitleImageParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self.og_title = ""
+        self.og_description = ""
+        self.image_candidates = []
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        if tag == "title":
+            self._in_title = True
+        elif tag == "meta":
+            key = (attrs_dict.get("property") or attrs_dict.get("name") or "").strip().lower()
+            content = (attrs_dict.get("content") or "").strip()
+            if not content:
+                return
+            if key == "og:title" and not self.og_title:
+                self.og_title = content
+            elif key == "og:description" and not self.og_description:
+                self.og_description = content
+            elif key in _META_IMAGE_KEYS and not content.startswith("data:"):
+                if content not in self.image_candidates:
+                    self.image_candidates.append(content)
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+
+
+def extract_page_meta(html_text: str, page_url: str) -> dict:
+    """Pulls og:title/og:description (context) and og:image + fallbacks
+    (main image, with alternates for resilience against a single stale/404
+    image-cache URL) out of a page's HTML."""
+    parser = _MetaTitleImageParser()
+    try:
+        parser.feed(html_text)
+    except Exception:
+        pass  # tolerate malformed markup - keep whatever was parsed so far
+
+    title = re.sub(r'\s+', ' ', (parser.og_title or parser.title or "").strip())
+
+    context_parts = []
+    if title:
+        context_parts.append(f"Produkt: {title}")
+    if parser.og_description:
+        desc = re.sub(r'\s+', ' ', parser.og_description.strip())[:200]
+        if desc:
+            context_parts.append(f"Opis: {desc}")
+    context = " | ".join(context_parts) or "Brak dodatkowego kontekstu tekstowego."
+
+    seen = set()
+    image_urls = []
+    for candidate in parser.image_candidates:
+        full_url = urljoin(page_url, candidate)
+        if _is_http_url(full_url) and full_url not in seen:
+            seen.add(full_url)
+            image_urls.append(full_url)
+
+    return {"context": context, "image_urls": image_urls, "title": title}
+
+
+# ---------------------------------------------------------------------------
+# Sitemap expansion
+# ---------------------------------------------------------------------------
+
+def _looks_like_sitemap_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return path.endswith(".xml") or "sitemap" in path
+
+
+def fetch_sitemap_urls(sitemap_url: str, depth: int = 0) -> list:
+    """Fetches a sitemap.xml (or sitemap index) and returns the page URLs it
+    lists, following nested sitemap indexes up to MAX_SITEMAP_DEPTH."""
+    if depth > MAX_SITEMAP_DEPTH:
+        return []
+
+    content, _final_url, _content_type = _fetch_url_bytes(sitemap_url, MAX_PAGE_FETCH_BYTES)
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return []
+
+    tag = root.tag.lower()
+    urls = []
+
+    if tag.endswith("sitemapindex"):
+        sub_sitemaps = []
+        for sitemap_el in root:
+            for loc in sitemap_el.iter():
+                if loc.tag.lower().endswith("loc") and loc.text and loc.text.strip():
+                    sub_sitemaps.append(loc.text.strip())
+                    break
+            if len(sub_sitemaps) >= MAX_SITEMAP_URLS_PER_FILE:
+                break
+        for sub_url in sub_sitemaps:
+            if not _is_http_url(sub_url):
+                continue
+            try:
+                urls.extend(fetch_sitemap_urls(sub_url, depth=depth + 1))
+            except Exception:
+                continue
+            if len(urls) >= MAX_SITEMAP_URLS_PER_FILE:
+                break
+    elif tag.endswith("urlset"):
+        for url_el in root:
+            for loc in url_el.iter():
+                if loc.tag.lower().endswith("loc") and loc.text and loc.text.strip():
+                    loc_url = loc.text.strip()
+                    if _is_http_url(loc_url):
+                        urls.append(loc_url)
+                    break
+            if len(urls) >= MAX_SITEMAP_URLS_PER_FILE:
+                break
+
+    return urls[:MAX_SITEMAP_URLS_PER_FILE]
+
+
+def expand_seed_urls(seed_urls: list) -> list:
+    """Any seed that looks like (or turns out to be) a sitemap gets expanded
+    into the page URLs it lists; everything else is used as-is."""
+    final_urls = []
+    seen = set()
+    for seed in seed_urls:
+        candidates = [seed]
+        if _looks_like_sitemap_url(seed):
+            try:
+                sitemap_urls = fetch_sitemap_urls(seed)
+                if sitemap_urls:
+                    candidates = sitemap_urls
+            except Exception:
+                candidates = [seed]  # fall back to treating it as a literal page URL
+
+        for url in candidates:
+            if url not in seen:
+                seen.add(url)
+                final_urls.append(url)
+        if len(final_urls) >= MAX_URLS_PER_BATCH:
+            break
+
+    return final_urls[:MAX_URLS_PER_BATCH]
+
+
+def parse_url_list_text(raw_text: str) -> list:
+    """Extracts one URL per non-empty line (also tolerates CSV-ish rows -
+    the first http(s) token on a line is picked up, the rest is ignored)."""
+    urls = []
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        for token in re.split(r'[;,\s]+', line):
+            token = token.strip().strip('"')
+            if _is_http_url(token):
+                urls.append(token)
+                break
+
+    seen = set()
+    deduped = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            deduped.append(u)
+    return deduped
+
+
+# ---------------------------------------------------------------------------
+# Image download
+# ---------------------------------------------------------------------------
+
+MAX_URL_IMAGE_BYTES = 25 * 1024 * 1024
 
 
 def fetch_image_dimensions_fast(url: str):
@@ -498,19 +344,6 @@ def fetch_image_dimensions_fast(url: str):
         return None
 
 
-URL_DOWNLOAD_TIMEOUT_SECONDS = 20
-MAX_URL_IMAGE_BYTES = 25 * 1024 * 1024
-MAX_URL_REDIRECTS = 5
-
-
-def _friendly_name_from_url(url: str) -> str:
-    """Derives a short display filename from a URL's path (falls back to the
-    full URL when the path has no usable basename, e.g. a query-only image
-    endpoint) - used for the "main image name" / image list in the CSV export."""
-    basename = os.path.basename(urlparse(url).path)
-    return basename if basename else url
-
-
 def download_image_from_url(url: str, dest_dir: str) -> str:
     """Downloads an image from a URL into dest_dir. Manually follows redirects
     (re-validating the host on each hop) and enforces scheme/type/size limits."""
@@ -524,7 +357,7 @@ def download_image_from_url(url: str, dest_dir: str) -> str:
         _check_hostname_is_public(parsed.hostname)
 
         response = session.get(
-            current_url, stream=True, timeout=URL_DOWNLOAD_TIMEOUT_SECONDS,
+            current_url, stream=True, timeout=PAGE_FETCH_TIMEOUT_SECONDS,
             headers={"User-Agent": "AltTextGenerator/1.0"}, allow_redirects=False,
         )
         try:
@@ -558,59 +391,6 @@ def download_image_from_url(url: str, dest_dir: str) -> str:
             response.close()
 
     raise ValueError("Zbyt wiele przekierowań podczas pobierania obrazu.")
-
-
-PAGE_FETCH_TIMEOUT_SECONDS = 20
-MAX_PAGE_FETCH_BYTES = 50 * 1024 * 1024  # a product/listing page's HTML shouldn't exceed this
-
-
-def download_html_page(url: str, dest_dir: str) -> str:
-    """Fetches a product/listing page's live HTML server-side (SSRF-guarded,
-    manual redirect re-validation - same pattern as download_image_from_url).
-    This is the alternative to uploading a browser-saved .html file: a
-    "Save Complete" export rewrites every <img src> to a local file in its
-    "..._files" folder, discarding the real, downloadable image URLs - fetching
-    the live page keeps those URLs intact."""
-    session = requests.Session()
-    current_url = url
-
-    for _ in range(MAX_URL_REDIRECTS + 1):
-        parsed = urlparse(current_url)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise ValueError("Nieprawidłowy URL (dozwolone są tylko linki http/https).")
-        _check_hostname_is_public(parsed.hostname)
-
-        response = session.get(
-            current_url, stream=True, timeout=PAGE_FETCH_TIMEOUT_SECONDS,
-            headers={"User-Agent": "AltTextGenerator/1.0"}, allow_redirects=False,
-        )
-        try:
-            if response.is_redirect or response.is_permanent_redirect:
-                location = response.headers.get("Location")
-                if not location:
-                    raise ValueError("Serwer zwrócił przekierowanie bez adresu docelowego.")
-                current_url = urljoin(current_url, location)
-                continue
-
-            response.raise_for_status()
-
-            content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
-            if content_type and not (content_type.startswith("text/html") or content_type.startswith("application/xhtml")):
-                raise ValueError(f"Adres nie zwraca strony HTML (Content-Type: {content_type}).")
-
-            dest_path = os.path.join(dest_dir, "source.html")
-            total = 0
-            with open(dest_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=65536):
-                    total += len(chunk)
-                    if total > MAX_PAGE_FETCH_BYTES:
-                        raise ValueError(f"Strona przekracza limit {MAX_PAGE_FETCH_BYTES // (1024 * 1024)} MB.")
-                    f.write(chunk)
-            return dest_path
-        finally:
-            response.close()
-
-    raise ValueError("Zbyt wiele przekierowań podczas pobierania strony.")
 
 
 # ---------------------------------------------------------------------------
@@ -673,12 +453,9 @@ ALT_TEXT_SYSTEM_PROMPT = (
 
 ALT_TEXT_PROMPT_TEMPLATE = (
     "Jesteś ekspertem SEO e-commerce. Przeanalizuj to zdjęcie produktu oraz poniższy "
-    "kontekst ze strony produktowej: {context}. Wygeneruj zwięzły, naturalny tekst ALT "
-    "(4-8 słów) po polsku. OPISZ PRZEDE WSZYSTKIM to, co faktycznie widać na zdjęciu - "
-    "jeśli kontekst zaczyna się od 'Na zdjęciu widać: ...', to właśnie to jest tematem "
-    "zdjęcia (np. konkretny akcesorium/część, a nie sam produkt główny) i od tego zacznij "
-    "opis. Markę i nazwę produktu dodaj tylko jako uzupełnienie, gdy ma to sens - NIE każdy "
-    "ALT musi zaczynać się od pełnej nazwy produktu głównego. Nie używaj słów 'zdjęcie "
+    "kontekst wyciągnięty ze strony produktowej: {context}. Wygeneruj zwięzły, naturalny "
+    "tekst ALT (4-8 słów) po polsku. Uwzględnij dokładną nazwę produktu/markę wyciągniętą "
+    "z kontekstu oraz to, co faktycznie widać na zdjęciu. Nie używaj słów 'zdjęcie "
     "przedstawia' ani 'obrazek'."
 )
 
@@ -789,9 +566,9 @@ def process_single_image(image_url: str, context: str, job_dir: str, fallback_ur
             "image_data": "",
         }
 
-    # Some candidates (e.g. a stale Magento image-cache rendition recovered
-    # from og:image/JSON-LD) can 404 independently of one another even though
-    # they're meant to be the same photo - try each in turn before giving up.
+    # og:image/twitter:image variants can point at the same photo under
+    # different (hash-based) cache URLs - one of them 404-ing shouldn't sink
+    # the whole image, so try each candidate in turn.
     candidate_urls = [image_url] + [u for u in (fallback_urls or []) if u != image_url]
     local_path = None
     used_url = image_url
@@ -823,6 +600,29 @@ def process_single_image(image_url: str, context: str, job_dir: str, fallback_ur
     }
 
 
+def process_page_url(page_url: str, job_dir: str) -> dict:
+    """One full unit of work: fetch a product page, pull its title/main image
+    from meta tags, download the image and generate its ALT text."""
+    html_text, final_url = fetch_page_html(page_url)
+    meta = extract_page_meta(html_text, final_url)
+
+    if not meta["image_urls"]:
+        return {
+            "page_url": page_url,
+            "image_url": "",
+            "context": meta["context"],
+            "alt": None,
+            "skipped": True,
+            "skip_reason": "Nie znaleziono obrazu głównego (brak og:image) na stronie.",
+            "image_data": "",
+        }
+
+    primary, *fallback_urls = meta["image_urls"]
+    result = process_single_image(primary, meta["context"], job_dir, fallback_urls=fallback_urls)
+    result["page_url"] = page_url
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Background job processing
 # ---------------------------------------------------------------------------
@@ -838,85 +638,57 @@ def clean_old_jobs():
             del JOBS[t_id]
 
 
-def background_worker(task_id: str, html_path: str, base_url: str, job_dir: str):
+def background_worker(task_id: str, seed_urls: list, job_dir: str):
     consecutive_errors = 0
     try:
         with JOBS_LOCK:
             if task_id in JOBS:
                 JOBS[task_id]["status"] = "parsing"
 
-        tasks = []
-        truncated = False
         try:
-            for product in extract_products_from_html(html_path, base_url):
-                for image_entry in product["images"]:
-                    tasks.append((
-                        image_entry["url"], product["context"], image_entry.get("hint", ""),
-                        product["label"], product["id"], image_entry.get("fallback_urls", []),
-                    ))
-                    if len(tasks) >= MAX_IMAGE_TASKS_PER_BATCH:
-                        truncated = True
-                        break
-                if truncated:
-                    break
+            final_urls = expand_seed_urls(seed_urls)
         except Exception as e:
             with JOBS_LOCK:
                 if task_id in JOBS:
                     JOBS[task_id]["status"] = "error"
-                    JOBS[task_id]["error_message"] = f"Błąd parsowania pliku HTML: {str(e)}"
+                    JOBS[task_id]["error_message"] = f"Błąd przygotowania listy adresów: {str(e)}"
             return
 
-        if not tasks:
+        if not final_urls:
             with JOBS_LOCK:
                 if task_id in JOBS:
                     JOBS[task_id]["status"] = "error"
-                    JOBS[task_id]["error_message"] = "Nie znaleziono żadnych produktów ani grafik w przesłanym pliku HTML."
+                    JOBS[task_id]["error_message"] = "Nie znaleziono żadnych prawidłowych adresów URL do przetworzenia."
             return
 
         with JOBS_LOCK:
             if task_id in JOBS:
-                JOBS[task_id]["total"] = len(tasks)
+                JOBS[task_id]["total"] = len(final_urls)
                 JOBS[task_id]["status"] = "processing"
-                if truncated:
-                    JOBS[task_id]["error_message"] = (
-                        f"Uwaga: znaleziono więcej niż {MAX_IMAGE_TASKS_PER_BATCH} grafik - "
-                        f"przetworzono pierwsze {MAX_IMAGE_TASKS_PER_BATCH}."
-                    )
 
         stop_event = threading.Event()
 
-        def worker_task(item):
+        def worker_task(page_url):
             nonlocal consecutive_errors
-
             if stop_event.is_set():
                 return
 
-            image_url, page_context, image_hint, label, page_id, fallback_urls = item
             is_error = False
             error_detail = None
-            ai_context = build_image_ai_context(page_context, image_hint)
-
             try:
-                res = process_single_image(image_url, ai_context, job_dir, fallback_urls=fallback_urls)
+                res = process_page_url(page_url, job_dir)
             except Exception as e:
                 is_error = True
                 error_detail = str(e)
                 res = {
-                    "image_url": image_url,
-                    "context": ai_context,
+                    "page_url": page_url,
+                    "image_url": "",
+                    "context": "",
                     "alt": f"Błąd przetwarzania: {error_detail}",
                     "skipped": False,
                     "skip_reason": None,
                     "image_data": "",
                 }
-
-            # Page/product identity + filename - used to regroup flat results
-            # back into "one row per page" for the CSV export. Derived from
-            # whichever URL actually succeeded (res["image_url"]), which may
-            # differ from the original candidate if a fallback URL was used.
-            res["page"] = label
-            res["page_id"] = page_id
-            res["image_name"] = _friendly_name_from_url(res.get("image_url") or image_url)
 
             with JOBS_LOCK:
                 if task_id not in JOBS or stop_event.is_set():
@@ -936,15 +708,15 @@ def background_worker(task_id: str, html_path: str, base_url: str, job_dir: str)
                         tot = JOBS[task_id]["total"]
                         JOBS[task_id]["error_message"] = (
                             f"Zatrzymano z powodu serii błędów: {error_detail} "
-                            f"Poprawnie wygenerowano ALT dla {succ}/{tot} obrazów."
+                            f"Poprawnie wygenerowano ALT dla {succ}/{tot} podstron."
                         )
                 else:
                     JOBS[task_id]["success_count"] += 1
                     consecutive_errors = 0
 
-        max_workers = min(MAX_WORKERS, len(tasks))
+        max_workers = min(MAX_WORKERS, len(final_urls))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(worker_task, t) for t in tasks]
+            futures = [executor.submit(worker_task, u) for u in final_urls]
             for future in as_completed(futures):
                 if stop_event.is_set():
                     break
@@ -972,68 +744,49 @@ def background_worker(task_id: str, html_path: str, base_url: str, job_dir: str)
 def request_entity_too_large(error):
     max_mb = app.config['MAX_CONTENT_LENGTH'] // (1024 * 1024)
     return jsonify({
-        "error": f"Przekroczono maksymalny rozmiar pliku ({max_mb} MB). Zmniejsz plik i spróbuj ponownie."
+        "error": f"Przekroczono maksymalny rozmiar żądania ({max_mb} MB). Zmniejsz listę adresów i spróbuj ponownie."
     }), 413
 
 
 @app.route('/')
 def home():
-    return render_template('index.html', max_content_mb=MAX_CONTENT_LENGTH_MB)
+    return render_template('index.html', max_urls_per_batch=MAX_URLS_PER_BATCH)
 
 
 @app.route('/generate-alt', methods=['POST'])
 def generate_alt():
     clean_old_jobs()
 
-    html_file = request.files.get('html_file')
-    page_url = (request.form.get('page_url') or "").strip()
-    base_url = (request.form.get('base_url') or "").strip()
+    urls_text = (request.form.get('urls_text') or "").strip()
+    urls_file = request.files.get('urls_file')
 
-    has_file = bool(html_file and html_file.filename)
+    seed_urls = []
+    if urls_text:
+        seed_urls = parse_url_list_text(urls_text)
+    elif urls_file and urls_file.filename:
+        ext = os.path.splitext(urls_file.filename)[1].lower()
+        if ext not in (".txt", ".csv"):
+            return jsonify({"error": "Akceptowane są wyłącznie pliki .txt/.csv."}), 400
+        try:
+            raw_text = urls_file.read().decode("utf-8-sig", errors="replace")
+        except Exception as e:
+            return jsonify({"error": f"Nie udało się odczytać pliku: {str(e)}"}), 400
+        seed_urls = parse_url_list_text(raw_text)
 
-    if not has_file and not page_url:
-        return jsonify({"error": "Prześlij plik .html/.htm albo podaj adres URL strony (http/https)."}), 400
+    if not seed_urls:
+        return jsonify({
+            "error": "Wklej listę adresów URL (po jednym w linijce) albo wgraj plik .txt/.csv z linkami. "
+                     "Link do sitemap.xml zostanie automatycznie rozwinięty na wszystkie podstrony."
+        }), 400
+
+    if len(seed_urls) > MAX_URLS_PER_BATCH:
+        return jsonify({
+            "error": f"Zbyt wiele adresów ({len(seed_urls)}). Maksymalnie {MAX_URLS_PER_BATCH} w jednej partii."
+        }), 400
 
     task_id = str(uuid.uuid4())
     job_dir = os.path.join(TMP_UPLOADS_DIR, task_id)
     os.makedirs(job_dir, exist_ok=True)
-
-    if has_file:
-        ext = os.path.splitext(html_file.filename)[1].lower()
-        if ext not in (".html", ".htm"):
-            shutil.rmtree(job_dir, ignore_errors=True)
-            return jsonify({"error": "Akceptowane są wyłącznie pliki .html/.htm."}), 400
-
-        if base_url:
-            parsed_base = urlparse(base_url)
-            if parsed_base.scheme not in ("http", "https") or not parsed_base.hostname:
-                shutil.rmtree(job_dir, ignore_errors=True)
-                return jsonify({"error": "Nieprawidłowy adres bazowy (base_url)."}), 400
-
-        html_path = os.path.join(job_dir, "source.html")
-        try:
-            html_file.save(html_path)
-        except Exception as e:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            return jsonify({"error": f"Błąd zapisu pliku: {str(e)}"}), 400
-
-        effective_base_url = base_url
-    else:
-        parsed_page = urlparse(page_url)
-        if parsed_page.scheme not in ("http", "https") or not parsed_page.hostname:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            return jsonify({"error": "Nieprawidłowy adres URL strony (dozwolone są tylko linki http/https)."}), 400
-
-        try:
-            html_path = download_html_page(page_url, job_dir)
-        except ValueError as e:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            return jsonify({"error": f"Nie udało się pobrać strony: {str(e)}"}), 400
-        except Exception as e:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            return jsonify({"error": f"Błąd pobierania strony: {str(e)}"}), 400
-
-        effective_base_url = base_url or page_url
 
     with JOBS_LOCK:
         JOBS[task_id] = {
@@ -1047,7 +800,7 @@ def generate_alt():
             "created_at": time.time(),
         }
 
-    thread = threading.Thread(target=background_worker, args=(task_id, html_path, effective_base_url, job_dir))
+    thread = threading.Thread(target=background_worker, args=(task_id, seed_urls, job_dir))
     thread.daemon = True
     thread.start()
 
