@@ -37,8 +37,8 @@
 
     <!-- Upload card -->
     <section class="bg-white border-2 border-neutral-900 rounded-xl p-6 sm:p-8 shadow-sm">
-      <h2 class="font-black uppercase text-lg tracking-wide mb-1">1. Wgraj plik HTML</h2>
-      <p class="text-sm text-neutral-500 mb-6">Wyeksportowana strona produktowa lub listing (obsługiwane pliki do {{ max_content_mb }} MB).</p>
+      <h2 class="font-black uppercase text-lg tracking-wide mb-1">1. Wgraj plik HTML albo podaj adres strony</h2>
+      <p class="text-sm text-neutral-500 mb-6">Wyeksportowana strona produktowa lub listing (obsługiwane pliki do {{ max_content_mb }} MB) — albo bezpośredni link do strony sklepu.</p>
 
       <form id="upload-form">
         <label id="dropzone"
@@ -52,13 +52,28 @@
           <input id="html_file" name="html_file" type="file" accept=".html,.htm" class="hidden">
         </label>
 
+        <div class="flex items-center gap-3 my-5">
+          <span class="flex-1 h-px bg-neutral-200"></span>
+          <span class="text-xs font-bold uppercase tracking-wide text-neutral-400">albo</span>
+          <span class="flex-1 h-px bg-neutral-200"></span>
+        </div>
+
+        <div>
+          <label for="page_url" class="block text-xs font-bold uppercase tracking-wide text-neutral-600 mb-1">
+            Adres URL strony
+          </label>
+          <input id="page_url" name="page_url" type="text" placeholder="https://sklep.pl/produkt/nazwa-produktu"
+                 class="w-full border border-neutral-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-[#00E676] focus:ring-2 focus:ring-emerald-100">
+          <p class="text-xs text-neutral-400 mt-1">Aplikacja sama pobierze i przeanalizuje stronę (tylko http/https). Wypełnij to pole zamiast wgrywania pliku.</p>
+        </div>
+
         <div class="mt-5">
           <label for="base_url" class="block text-xs font-bold uppercase tracking-wide text-neutral-600 mb-1">
-            Adres bazowy (opcjonalnie)
+            Adres bazowy (opcjonalnie, tylko dla wgranego pliku)
           </label>
           <input id="base_url" name="base_url" type="text" placeholder="https://sklep.pl/"
                  class="w-full border border-neutral-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-[#00E676] focus:ring-2 focus:ring-emerald-100">
-          <p class="text-xs text-neutral-400 mt-1">Używany do rozwiązywania względnych adresów URL grafik (np. /img/produkt.jpg).</p>
+          <p class="text-xs text-neutral-400 mt-1">Używany do rozwiązywania względnych adresów URL grafik (np. /img/produkt.jpg) we wgranym pliku.</p>
         </div>
 
         <button id="submit-btn" type="submit"
@@ -121,6 +136,7 @@
   const dropzoneText = document.getElementById('dropzone-text');
   const fileInput = document.getElementById('html_file');
   const baseUrlInput = document.getElementById('base_url');
+  const pageUrlInput = document.getElementById('page_url');
   const form = document.getElementById('upload-form');
   const submitBtn = document.getElementById('submit-btn');
   const errorBanner = document.getElementById('error-banner');
@@ -164,11 +180,27 @@
     dropzone.classList.remove('drop-active');
     if (e.dataTransfer.files.length) {
       fileInput.files = e.dataTransfer.files;
+      pageUrlInput.value = '';
       updateDropzoneLabel();
     }
   });
 
-  fileInput.addEventListener('change', updateDropzoneLabel);
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length) {
+      pageUrlInput.value = '';
+    }
+    updateDropzoneLabel();
+  });
+
+  // The two inputs are mutually exclusive - typing a URL clears any previously
+  // selected file (which a browser keeps around across submits), so the app
+  // never silently reuses a stale file instead of the URL the user just typed.
+  pageUrlInput.addEventListener('input', () => {
+    if (pageUrlInput.value.trim() && fileInput.files.length) {
+      fileInput.value = '';
+      updateDropzoneLabel();
+    }
+  });
 
   function updateDropzoneLabel() {
     if (fileInput.files.length) {
@@ -191,20 +223,32 @@
     e.preventDefault();
     clearError();
 
-    if (!fileInput.files.length) {
-      showError('Wybierz plik .html przed wysłaniem.');
+    const hasFile = fileInput.files.length > 0;
+    const pageUrl = pageUrlInput.value.trim();
+
+    if (!hasFile && !pageUrl) {
+      showError('Wybierz plik .html albo podaj adres URL strony przed wysłaniem.');
+      return;
+    }
+
+    if (!hasFile && !/^https?:\/\//i.test(pageUrl)) {
+      showError('Adres URL strony musi zaczynać się od http:// lub https://.');
       return;
     }
 
     resetUI();
     submitBtn.disabled = true;
     progressSection.classList.remove('hidden');
-    progressStatus.textContent = 'Wysyłanie pliku...';
+    progressStatus.textContent = hasFile ? 'Wysyłanie pliku...' : 'Pobieranie strony...';
 
     const formData = new FormData();
-    formData.append('html_file', fileInput.files[0]);
-    if (baseUrlInput.value.trim()) {
-      formData.append('base_url', baseUrlInput.value.trim());
+    if (hasFile) {
+      formData.append('html_file', fileInput.files[0]);
+      if (baseUrlInput.value.trim()) {
+        formData.append('base_url', baseUrlInput.value.trim());
+      }
+    } else {
+      formData.append('page_url', pageUrl);
     }
 
     try {
@@ -343,10 +387,31 @@
   exportBtn.addEventListener('click', () => {
     if (!currentResults.length) return;
 
-    const rows = [['URL Obrazka', 'Kontekst Produktu', 'Wygenerowany ALT']];
+    // Regroup the flat per-image results back into one row per page/product,
+    // preserving the order in which each page's images were first seen.
+    const groups = [];
+    const groupsByKey = new Map();
+
     currentResults.forEach(r => {
-      const alt = r.skipped ? (r.skip_reason || '') : (r.alt || '');
-      rows.push([r.image_url || '', r.context || '', alt]);
+      const key = r.page_id || r.page || 'produkt';
+      let group = groupsByKey.get(key);
+      if (!group) {
+        group = { page: r.page || '', images: [], alts: [] };
+        groupsByKey.set(key, group);
+        groups.push(group);
+      }
+      group.images.push(r.image_name || r.image_url || '');
+      group.alts.push(r.skipped ? (r.skip_reason || 'Pominięto') : (r.alt || ''));
+    });
+
+    const rows = [['Strona', 'Nazwa grafiki głównej', 'Grafiki na stronie', 'Atrybuty ALT']];
+    groups.forEach(g => {
+      rows.push([
+        g.page,
+        g.images[0] || '',
+        g.images.join(', '),
+        g.alts.join(', '),
+      ]);
     });
 
     const csvBody = rows

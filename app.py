@@ -24,10 +24,10 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# Upload limits - HTML exports can be large (up to ~2 GB), but Werkzeug always
+# Upload limits - HTML exports can be large (up to ~3 GB), but Werkzeug always
 # spools multipart file parts to a disk-backed temp file, so RAM usage stays low
 # regardless of this cap; it only bounds total request size.
-MAX_CONTENT_LENGTH_MB = 2048
+MAX_CONTENT_LENGTH_MB = 3072
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH_MB * 1024 * 1024
 JOB_MAX_AGE_SECONDS = 3600      # Job retention time in memory (1h)
 MAX_WORKERS = 5                  # Number of parallel connections to OpenAI
@@ -82,7 +82,19 @@ PRODUCT_CONTAINER_RE = re.compile(
 )
 BREADCRUMB_RE = re.compile(r'breadcrumb|okruszk', re.IGNORECASE)
 BRAND_RE = re.compile(r'\b(brand|producer|manufacturer|marka|producent)\b', re.IGNORECASE)
-TITLE_RE = re.compile(r'(product[-_]?(name|title)|nazwa[-_]?produktu)', re.IGNORECASE)
+TITLE_RE = re.compile(
+    r'(product[-_]?(name|title)|nazwa[-_]?produktu|product-info-name)',
+    re.IGNORECASE,
+)
+
+# "Related/upsell/cross-sell" widgets (e.g. "Może Ci się spodobać") on real
+# product pages reuse product-card-like markup for their recommendation tiles -
+# those must never be mistaken for the products actually being alt-tagged.
+EXCLUDED_CONTAINER_RE = re.compile(
+    r'(related|cross-?sell|up-?sell|recommend|carousel|swiper|slider|'
+    r'you-?may-?also-?like|similar[-_]?products?|polecane|podobne)',
+    re.IGNORECASE,
+)
 
 IMG_SRC_ATTR_PRIORITY = ("data-lazy-src", "data-src", "data-original", "src")
 
@@ -171,10 +183,12 @@ def _first_match_text(elem, class_re) -> str:
     return ""
 
 
-def _extract_images(elem, base_url: str) -> list:
+def _extract_images(elem, base_url: str, skip_excluded: bool = False) -> list:
     urls = []
     seen = set()
     for img in elem.iter("img"):
+        if skip_excluded and _has_excluded_ancestor(img):
+            continue
         chosen = None
         for attr in IMG_SRC_ATTR_PRIORITY:
             v = img.get(attr)
@@ -204,6 +218,19 @@ def _looks_like_product_container(elem) -> bool:
     if not PRODUCT_CONTAINER_RE.search(_elem_classes_and_id(elem)):
         return False
     return elem.find(".//img") is not None
+
+
+def _has_excluded_ancestor(elem) -> bool:
+    """True if elem sits inside a related/upsell/cross-sell/carousel widget -
+    those reuse product-card-like markup for recommendation tiles, which are
+    never the actual product(s) being alt-tagged on the page."""
+    parent = elem.getparent()
+    while parent is not None:
+        tag = parent.tag
+        if isinstance(tag, str) and EXCLUDED_CONTAINER_RE.search(_elem_classes_and_id(parent)):
+            return True
+        parent = parent.getparent()
+    return False
 
 
 def _clear_element(elem):
@@ -253,7 +280,7 @@ def _extract_single_product_fallback(file_path: str, base_url: str):
     if root is None:
         return
 
-    images = [u for u in _extract_images(root, base_url) if not is_placeholder_image(u)]
+    images = [u for u in _extract_images(root, base_url, skip_excluded=True) if not is_placeholder_image(u)]
     if not images:
         return
 
@@ -265,7 +292,7 @@ def _extract_single_product_fallback(file_path: str, base_url: str):
     specs_text = _text_of(root)
 
     context = build_product_context(title, brand, breadcrumbs, specs_text)
-    yield {"images": images, "context": context, "label": (title or brand or "Produkt")[:80]}
+    yield {"images": images, "context": context, "label": (title or brand or "Produkt")[:80], "id": uuid.uuid4().hex}
 
 
 def extract_products_from_html(file_path: str, base_url: str = ""):
@@ -299,14 +326,15 @@ def extract_products_from_html(file_path: str, base_url: str = ""):
                     page_breadcrumbs = t
 
         if _looks_like_product_container(elem):
-            images = [u for u in _extract_images(elem, base_url) if not is_placeholder_image(u)]
-            if images:
-                products_found = True
-                title = _first_match_text(elem, TITLE_RE) or page_h1
-                brand = _first_match_text(elem, BRAND_RE)
-                specs_text = _text_of(elem)
-                context = build_product_context(title, brand, page_breadcrumbs, specs_text)
-                yield {"images": images, "context": context, "label": (title or brand or "Produkt")[:80]}
+            if not _has_excluded_ancestor(elem):
+                images = [u for u in _extract_images(elem, base_url) if not is_placeholder_image(u)]
+                if images:
+                    products_found = True
+                    title = _first_match_text(elem, TITLE_RE) or page_h1
+                    brand = _first_match_text(elem, BRAND_RE)
+                    specs_text = _text_of(elem)
+                    context = build_product_context(title, brand, page_breadcrumbs, specs_text)
+                    yield {"images": images, "context": context, "label": (title or brand or "Produkt")[:80], "id": uuid.uuid4().hex}
             _clear_element(elem)
 
     del parse_context
@@ -370,6 +398,14 @@ MAX_URL_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_URL_REDIRECTS = 5
 
 
+def _friendly_name_from_url(url: str) -> str:
+    """Derives a short display filename from a URL's path (falls back to the
+    full URL when the path has no usable basename, e.g. a query-only image
+    endpoint) - used for the "main image name" / image list in the CSV export."""
+    basename = os.path.basename(urlparse(url).path)
+    return basename if basename else url
+
+
 def download_image_from_url(url: str, dest_dir: str) -> str:
     """Downloads an image from a URL into dest_dir. Manually follows redirects
     (re-validating the host on each hop) and enforces scheme/type/size limits."""
@@ -417,6 +453,59 @@ def download_image_from_url(url: str, dest_dir: str) -> str:
             response.close()
 
     raise ValueError("Zbyt wiele przekierowań podczas pobierania obrazu.")
+
+
+PAGE_FETCH_TIMEOUT_SECONDS = 20
+MAX_PAGE_FETCH_BYTES = 50 * 1024 * 1024  # a product/listing page's HTML shouldn't exceed this
+
+
+def download_html_page(url: str, dest_dir: str) -> str:
+    """Fetches a product/listing page's live HTML server-side (SSRF-guarded,
+    manual redirect re-validation - same pattern as download_image_from_url).
+    This is the alternative to uploading a browser-saved .html file: a
+    "Save Complete" export rewrites every <img src> to a local file in its
+    "..._files" folder, discarding the real, downloadable image URLs - fetching
+    the live page keeps those URLs intact."""
+    session = requests.Session()
+    current_url = url
+
+    for _ in range(MAX_URL_REDIRECTS + 1):
+        parsed = urlparse(current_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("Nieprawidłowy URL (dozwolone są tylko linki http/https).")
+        _check_hostname_is_public(parsed.hostname)
+
+        response = session.get(
+            current_url, stream=True, timeout=PAGE_FETCH_TIMEOUT_SECONDS,
+            headers={"User-Agent": "AltTextGenerator/1.0"}, allow_redirects=False,
+        )
+        try:
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("Serwer zwrócił przekierowanie bez adresu docelowego.")
+                current_url = urljoin(current_url, location)
+                continue
+
+            response.raise_for_status()
+
+            content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if content_type and not (content_type.startswith("text/html") or content_type.startswith("application/xhtml")):
+                raise ValueError(f"Adres nie zwraca strony HTML (Content-Type: {content_type}).")
+
+            dest_path = os.path.join(dest_dir, "source.html")
+            total = 0
+            with open(dest_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=65536):
+                    total += len(chunk)
+                    if total > MAX_PAGE_FETCH_BYTES:
+                        raise ValueError(f"Strona przekracza limit {MAX_PAGE_FETCH_BYTES // (1024 * 1024)} MB.")
+                    f.write(chunk)
+            return dest_path
+        finally:
+            response.close()
+
+    raise ValueError("Zbyt wiele przekierowań podczas pobierania strony.")
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +725,7 @@ def background_worker(task_id: str, html_path: str, base_url: str, job_dir: str)
         try:
             for product in extract_products_from_html(html_path, base_url):
                 for image_url in product["images"]:
-                    tasks.append((image_url, product["context"], product["label"]))
+                    tasks.append((image_url, product["context"], product["label"], product["id"]))
                     if len(tasks) >= MAX_IMAGE_TASKS_PER_BATCH:
                         truncated = True
                         break
@@ -674,7 +763,7 @@ def background_worker(task_id: str, html_path: str, base_url: str, job_dir: str)
             if stop_event.is_set():
                 return
 
-            image_url, context, _label = item
+            image_url, context, label, page_id = item
             is_error = False
             error_detail = None
 
@@ -691,6 +780,12 @@ def background_worker(task_id: str, html_path: str, base_url: str, job_dir: str)
                     "skip_reason": None,
                     "image_data": "",
                 }
+
+            # Page/product identity + filename - used to regroup flat results
+            # back into "one row per page" for the CSV export.
+            res["page"] = label
+            res["page_id"] = page_id
+            res["image_name"] = _friendly_name_from_url(image_url)
 
             with JOBS_LOCK:
                 if task_id not in JOBS or stop_event.is_set():
@@ -759,30 +854,55 @@ def home():
 def generate_alt():
     clean_old_jobs()
 
-    if 'html_file' not in request.files or not request.files['html_file'].filename:
-        return jsonify({"error": "Nie przesłano pliku HTML."}), 400
-
-    html_file = request.files['html_file']
-    ext = os.path.splitext(html_file.filename)[1].lower()
-    if ext not in (".html", ".htm"):
-        return jsonify({"error": "Akceptowane są wyłącznie pliki .html/.htm."}), 400
-
+    html_file = request.files.get('html_file')
+    page_url = (request.form.get('page_url') or "").strip()
     base_url = (request.form.get('base_url') or "").strip()
-    if base_url:
-        parsed_base = urlparse(base_url)
-        if parsed_base.scheme not in ("http", "https") or not parsed_base.hostname:
-            return jsonify({"error": "Nieprawidłowy adres bazowy (base_url)."}), 400
+
+    has_file = bool(html_file and html_file.filename)
+
+    if not has_file and not page_url:
+        return jsonify({"error": "Prześlij plik .html/.htm albo podaj adres URL strony (http/https)."}), 400
 
     task_id = str(uuid.uuid4())
     job_dir = os.path.join(TMP_UPLOADS_DIR, task_id)
     os.makedirs(job_dir, exist_ok=True)
-    html_path = os.path.join(job_dir, "source.html")
 
-    try:
-        html_file.save(html_path)
-    except Exception as e:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return jsonify({"error": f"Błąd zapisu pliku: {str(e)}"}), 400
+    if has_file:
+        ext = os.path.splitext(html_file.filename)[1].lower()
+        if ext not in (".html", ".htm"):
+            shutil.rmtree(job_dir, ignore_errors=True)
+            return jsonify({"error": "Akceptowane są wyłącznie pliki .html/.htm."}), 400
+
+        if base_url:
+            parsed_base = urlparse(base_url)
+            if parsed_base.scheme not in ("http", "https") or not parsed_base.hostname:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                return jsonify({"error": "Nieprawidłowy adres bazowy (base_url)."}), 400
+
+        html_path = os.path.join(job_dir, "source.html")
+        try:
+            html_file.save(html_path)
+        except Exception as e:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            return jsonify({"error": f"Błąd zapisu pliku: {str(e)}"}), 400
+
+        effective_base_url = base_url
+    else:
+        parsed_page = urlparse(page_url)
+        if parsed_page.scheme not in ("http", "https") or not parsed_page.hostname:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            return jsonify({"error": "Nieprawidłowy adres URL strony (dozwolone są tylko linki http/https)."}), 400
+
+        try:
+            html_path = download_html_page(page_url, job_dir)
+        except ValueError as e:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            return jsonify({"error": f"Nie udało się pobrać strony: {str(e)}"}), 400
+        except Exception as e:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            return jsonify({"error": f"Błąd pobierania strony: {str(e)}"}), 400
+
+        effective_base_url = base_url or page_url
 
     with JOBS_LOCK:
         JOBS[task_id] = {
@@ -796,7 +916,7 @@ def generate_alt():
             "created_at": time.time(),
         }
 
-    thread = threading.Thread(target=background_worker, args=(task_id, html_path, base_url, job_dir))
+    thread = threading.Thread(target=background_worker, args=(task_id, html_path, effective_base_url, job_dir))
     thread.daemon = True
     thread.start()
 
