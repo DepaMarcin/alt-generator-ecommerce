@@ -105,10 +105,8 @@
         <table class="min-w-full text-sm">
           <thead class="bg-black text-white uppercase text-xs tracking-wide">
             <tr>
-              <th class="text-left px-4 py-3 w-28">Podgląd</th>
-              <th class="text-left px-4 py-3">URL Strony</th>
-              <th class="text-left px-4 py-3">Kontekst</th>
-              <th class="text-left px-4 py-3">Wygenerowany ALT</th>
+              <th class="text-left px-4 py-3 w-72">URL Strony / Produkt</th>
+              <th class="text-left px-4 py-3">Pliki graficzne i wygenerowane ALTy</th>
             </tr>
           </thead>
           <tbody id="results-body" class="divide-y divide-neutral-200"></tbody>
@@ -333,42 +331,76 @@
     return div.innerHTML;
   }
 
+  function fileNameFromUrl(url) {
+    if (!url) return '(brak nazwy pliku)';
+    let path = url;
+    try {
+      path = new URL(url).pathname;
+    } catch (e) {
+      // not a fully-qualified URL - fall back to splitting the raw string below
+    }
+    const last = path.split('/').filter(Boolean).pop();
+    if (!last) return url;
+    try {
+      return decodeURIComponent(last);
+    } catch (e) {
+      return last;
+    }
+  }
+
+  function imageAltRowHtml(img, isMain) {
+    if (!img) return '';
+    const filename = escapeHtml(fileNameFromUrl(img.image_url));
+    const badge = isMain
+      ? '<span class="inline-block bg-[#00E676] text-black text-[10px] font-black uppercase tracking-wide px-2 py-0.5 rounded mr-2 whitespace-nowrap">🟢 Grafika główna</span>'
+      : '';
+
+    let altPart;
+    if (img.skipped) {
+      altPart = `<span class="text-xs text-neutral-400 italic">${escapeHtml(img.skip_reason || 'Pominięto')}</span>`;
+    } else {
+      altPart = `<code class="alt-code bg-emerald-50 text-neutral-900 border border-[#00E676] px-2 py-1 rounded text-xs font-semibold">${escapeHtml(img.alt || '')}</code>`;
+    }
+
+    const rowClass = isMain
+      ? 'flex flex-wrap items-center gap-2 py-2 px-2 rounded-md bg-neutral-50 border border-neutral-200 mb-2'
+      : 'flex flex-wrap items-center gap-2 py-1.5 border-b border-neutral-100 last:border-b-0';
+
+    return `
+      <div class="${rowClass}">
+        ${badge}
+        <span class="font-mono text-xs text-neutral-700 break-all">${filename}</span>
+        <span class="text-neutral-300">&rarr;</span>
+        ${altPart}
+      </div>
+    `;
+  }
+
   function renderNewRows() {
     for (let i = renderedCount; i < currentResults.length; i++) {
       const r = currentResults[i];
+      const others = r.other_images || [];
       const tr = document.createElement('tr');
       tr.className = 'align-top hover:bg-neutral-50';
 
-      const previewCell = document.createElement('td');
-      previewCell.className = 'px-4 py-3';
-      if (r.image_data) {
-        previewCell.innerHTML = `<img src="${r.image_data}" class="w-16 h-16 object-cover rounded border border-neutral-300" alt="">`;
-      } else {
-        previewCell.innerHTML = `<div class="w-16 h-16 rounded border border-neutral-300 bg-neutral-100 flex items-center justify-center text-neutral-400 text-xs text-center px-1">brak podglądu</div>`;
-      }
-
       const pageCell = document.createElement('td');
-      pageCell.className = 'px-4 py-3 text-xs max-w-xs break-all';
-      pageCell.innerHTML = r.page_url
-        ? `<a href="${escapeHtml(r.page_url)}" target="_blank" rel="noopener" class="text-neutral-600 underline hover:text-[#00C853]">${escapeHtml(r.page_url)}</a>`
+      pageCell.className = 'px-4 py-3 text-xs max-w-xs break-all align-top';
+      const pageLink = r.page_url
+        ? `<a href="${escapeHtml(r.page_url)}" target="_blank" rel="noopener" class="text-neutral-800 font-semibold underline hover:text-[#00C853]">${escapeHtml(r.page_url)}</a>`
         : '';
+      const contextLine = r.context ? `<div class="text-neutral-400 mt-1">${escapeHtml(r.context)}</div>` : '';
+      pageCell.innerHTML = pageLink + contextLine;
 
-      const contextCell = document.createElement('td');
-      contextCell.className = 'px-4 py-3 text-xs text-neutral-600 max-w-xs';
-      contextCell.textContent = r.context || '';
+      const filesCell = document.createElement('td');
+      filesCell.className = 'px-4 py-3 align-top';
+      let filesHtml = imageAltRowHtml(r.main_image, true);
+      others.forEach(img => {
+        filesHtml += imageAltRowHtml(img, false);
+      });
+      filesCell.innerHTML = filesHtml || '<span class="text-xs text-neutral-300">&mdash;</span>';
 
-      const altCell = document.createElement('td');
-      altCell.className = 'px-4 py-3';
-      if (r.skipped) {
-        altCell.innerHTML = `<span class="text-xs text-neutral-400 italic">${escapeHtml(r.skip_reason || 'Pominięto')}</span>`;
-      } else {
-        altCell.innerHTML = `<code class="alt-code bg-emerald-50 text-neutral-900 border border-[#00E676] px-2 py-1 rounded text-xs font-semibold">${escapeHtml(r.alt || '')}</code>`;
-      }
-
-      tr.appendChild(previewCell);
       tr.appendChild(pageCell);
-      tr.appendChild(contextCell);
-      tr.appendChild(altCell);
+      tr.appendChild(filesCell);
       resultsBody.appendChild(tr);
     }
     renderedCount = currentResults.length;
@@ -377,10 +409,15 @@
   exportBtn.addEventListener('click', () => {
     if (!currentResults.length) return;
 
-    const rows = [['URL Strony', 'URL Obrazka', 'Kontekst Produktu', 'Wygenerowany ALT']];
+    const rows = [['URL Strony', 'Typ Grafiki', 'URL Obrazka', 'Kontekst Produktu', 'Wygenerowany ALT']];
     currentResults.forEach(r => {
-      const alt = r.skipped ? (r.skip_reason || '') : (r.alt || '');
-      rows.push([r.page_url || '', r.image_url || '', r.context || '', alt]);
+      const addRow = (typeLabel, img) => {
+        if (!img) return;
+        const alt = img.skipped ? (img.skip_reason || '') : (img.alt || '');
+        rows.push([r.page_url || '', typeLabel, img.image_url || '', r.context || '', alt]);
+      };
+      addRow('Główna', r.main_image);
+      (r.other_images || []).forEach((img, idx) => addRow(`Dodatkowa #${idx + 1}`, img));
     });
 
     const csvBody = rows

@@ -1,6 +1,5 @@
 import os
 import re
-import io
 import uuid
 import ipaddress
 import socket
@@ -10,6 +9,8 @@ import mimetypes
 import base64
 import shutil
 import random
+import json
+import html
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from urllib.parse import urlparse, urljoin
@@ -42,7 +43,7 @@ CONSECUTIVE_ERROR_LIMIT = 5          # Isolated transient errors shouldn't abort
 MAX_URLS_PER_BATCH = 1000            # Safety cap on how many page URLs one batch can queue (after sitemap expansion)
 MAX_SITEMAP_URLS_PER_FILE = 2000     # Cap per individual sitemap/sitemap-index fetch
 MAX_SITEMAP_DEPTH = 3                # How many levels of nested sitemap indexes to follow
-MIN_IMAGE_DIMENSION = 150            # px - images smaller than this on either side are treated as icons
+MAX_IMAGES_PER_PAGE = 30             # Safety cap on how many images one page can queue (incl. the main image)
 PAGE_FETCH_TIMEOUT_SECONDS = 20
 MAX_PAGE_FETCH_BYTES = 15 * 1024 * 1024   # a product page's HTML/sitemap XML shouldn't exceed this
 MAX_URL_REDIRECTS = 5
@@ -127,53 +128,217 @@ def fetch_page_html(url: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Meta-tag extraction (og:title/og:image) - deliberately minimal: we only
-# need a handful of <meta> tags and <title>, not a full DOM.
+# Page content extraction (og:title/description + every real <img> on the
+# page) - deliberately still not a full DOM parse, just the handful of tags
+# we actually need.
 # ---------------------------------------------------------------------------
 
 _META_IMAGE_KEYS = ("og:image", "og:image:url", "og:image:secure_url", "twitter:image", "twitter:image:src")
+IMG_SRC_ATTR_PRIORITY = ("data-lazy-src", "data-src", "data-original", "src")
+
+# Priority 3 signals for the main-image cascade: an <img> is treated as "the"
+# product photo if it's explicitly hinted as high-priority, or sits inside a
+# gallery/media container - even without any OpenGraph/JSON-LD data.
+_GALLERY_CONTAINER_MARKERS = ("gallery", "product-media")
+_VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+}
 
 
-class _MetaTitleImageParser(HTMLParser):
+def _is_svg_url(url: str) -> bool:
+    return urlparse(url).path.lower().endswith(".svg")
+
+
+def _decode_unicode_js_escapes(text: str) -> str:
+    """Undoes JS-style \\uXXXX escapes (and the \\/ escape) that leak into
+    image URLs when a page embeds them as a raw JSON string (Magento/Hyva
+    inline state, JSON-LD, etc.) instead of a real HTML attribute."""
+    def repl(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except ValueError:
+            return match.group(0)
+    return re.sub(r'\\u([0-9a-fA-F]{4})', repl, text).replace('\\/', '/')
+
+
+def sanitize_image_url(raw_url, page_url: str):
+    """Mandatory cleanup for every image URL candidate before it's used or
+    stored: decodes JS unicode escapes and HTML entities, resolves relative
+    paths against the page URL, and validates the result is a genuine,
+    well-formed http(s) URL. Returns None if the candidate can't be turned
+    into a usable URL."""
+    if not raw_url or not isinstance(raw_url, str):
+        return None
+
+    text = raw_url.strip()
+    if not text:
+        return None
+
+    text = _decode_unicode_js_escapes(text)
+    text = html.unescape(text)
+    text = re.sub(r'\s+', '', text).strip()
+
+    if not text or text.startswith(("data:", "javascript:", "#")):
+        return None
+
+    if not text.lower().startswith(("http://", "https://")):
+        text = urljoin(page_url, text)
+
+    parsed = urlparse(text)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+
+    return text
+
+
+def _extract_jsonld_product_image(ld_json_blocks: list):
+    """Priority 2 of the main-image cascade: looks for a schema.org Product
+    node (optionally nested in an @graph array) inside <script
+    type="application/ld+json"> blocks and returns its "image" field."""
+    for block in ld_json_blocks:
+        block = block.strip()
+        if not block:
+            continue
+        try:
+            data = json.loads(block)
+        except (ValueError, TypeError):
+            continue
+
+        items = data if isinstance(data, list) else [data]
+        expanded = []
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("@graph"), list):
+                expanded.extend(item["@graph"])
+            else:
+                expanded.append(item)
+
+        for item in expanded:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("@type")
+            type_list = item_type if isinstance(item_type, list) else [item_type]
+            if not any(isinstance(t, str) and t.lower() == "product" for t in type_list):
+                continue
+
+            image = item.get("image")
+            if isinstance(image, list) and image:
+                image = image[0]
+            if isinstance(image, dict):
+                image = image.get("url") or image.get("@id")
+            if isinstance(image, str) and image.strip():
+                return image.strip()
+
+    return None
+
+
+class _PageParser(HTMLParser):
+    """Single pass over the page: captures <title>/og:title/og:description
+    (context), the main-image cascade signals (og:image/twitter:image,
+    JSON-LD Product.image, fetchpriority/eager/gallery <img> hints), AND
+    every <img> tag actually rendered on the page (so nothing gets missed)."""
+
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.title = ""
         self.og_title = ""
         self.og_description = ""
-        self.image_candidates = []
+        self.meta_image_candidates = []
+        self.img_urls = []
+        self.priority_img_urls = []
+        self.ld_json_blocks = []
         self._in_title = False
+        self._in_ldjson = False
+        self._ldjson_buffer = ""
+        self._seen_img_urls = set()
+        self._seen_priority_urls = set()
+        self._container_stack = []  # bool per open non-void ancestor: "looks like a gallery"
 
     def handle_starttag(self, tag, attrs):
         attrs_dict = dict(attrs)
+        classes = (attrs_dict.get("class") or "").lower().split()
+        elid = (attrs_dict.get("id") or "").lower()
+        is_gallery_frame = (
+            any(marker in cls for cls in classes for marker in _GALLERY_CONTAINER_MARKERS)
+            or any(marker in elid for marker in _GALLERY_CONTAINER_MARKERS)
+        )
+
         if tag == "title":
             self._in_title = True
+        elif tag == "script":
+            script_type = (attrs_dict.get("type") or "").strip().lower()
+            if script_type == "application/ld+json":
+                self._in_ldjson = True
+                self._ldjson_buffer = ""
         elif tag == "meta":
             key = (attrs_dict.get("property") or attrs_dict.get("name") or "").strip().lower()
             content = (attrs_dict.get("content") or "").strip()
-            if not content:
-                return
-            if key == "og:title" and not self.og_title:
-                self.og_title = content
-            elif key == "og:description" and not self.og_description:
-                self.og_description = content
-            elif key in _META_IMAGE_KEYS and not content.startswith("data:"):
-                if content not in self.image_candidates:
-                    self.image_candidates.append(content)
+            if content:
+                if key == "og:title" and not self.og_title:
+                    self.og_title = content
+                elif key == "og:description" and not self.og_description:
+                    self.og_description = content
+                elif key in _META_IMAGE_KEYS and not content.startswith("data:"):
+                    if content not in self.meta_image_candidates:
+                        self.meta_image_candidates.append(content)
+        elif tag == "img":
+            chosen = None
+            for attr in IMG_SRC_ATTR_PRIORITY:
+                v = attrs_dict.get(attr)
+                if v and v.strip() and not v.strip().startswith("data:"):
+                    chosen = v.strip()
+                    break
+            if not chosen:
+                srcset = attrs_dict.get("srcset") or attrs_dict.get("data-srcset")
+                if srcset:
+                    first = srcset.split(",")[0].strip().split(" ")[0]
+                    if first and not first.startswith("data:"):
+                        chosen = first
+
+            if chosen and chosen not in self._seen_img_urls:
+                self._seen_img_urls.add(chosen)
+                self.img_urls.append(chosen)
+
+            if chosen and chosen not in self._seen_priority_urls:
+                fetchpriority = (attrs_dict.get("fetchpriority") or "").strip().lower()
+                loading = (attrs_dict.get("loading") or "").strip().lower()
+                in_gallery = is_gallery_frame or any(self._container_stack)
+                if fetchpriority == "high" or loading == "eager" or in_gallery:
+                    self._seen_priority_urls.add(chosen)
+                    self.priority_img_urls.append(chosen)
+
+        if tag not in _VOID_TAGS:
+            self._container_stack.append(is_gallery_frame)
 
     def handle_endtag(self, tag):
         if tag == "title":
             self._in_title = False
+        elif tag == "script":
+            if self._in_ldjson:
+                self.ld_json_blocks.append(self._ldjson_buffer)
+            self._in_ldjson = False
+
+        if tag not in _VOID_TAGS and self._container_stack:
+            self._container_stack.pop()
 
     def handle_data(self, data):
         if self._in_title:
             self.title += data
+        elif self._in_ldjson:
+            self._ldjson_buffer += data
 
 
-def extract_page_meta(html_text: str, page_url: str) -> dict:
-    """Pulls og:title/og:description (context) and og:image + fallbacks
-    (main image, with alternates for resilience against a single stale/404
-    image-cache URL) out of a page's HTML."""
-    parser = _MetaTitleImageParser()
+def extract_page_content(html_text: str, page_url: str) -> dict:
+    """Pulls the page context (og:title/description) plus every image on the
+    page. The main image is picked via a cascade, strongest signal first:
+    (1) og:image/twitter:image meta tags, (2) JSON-LD Product.image,
+    (3) an <img> hinted as high-priority/eager or sitting inside a gallery
+    container - falling back to the first <img> on the page if none of that
+    is present. Every candidate URL is sanitized/decoded/resolved to an
+    absolute http(s) URL before use. SVG icons are excluded - everything
+    else (including small graphics) is kept, since size alone isn't a
+    reliable signal of relevance here."""
+    parser = _PageParser()
     try:
         parser.feed(html_text)
     except Exception:
@@ -191,14 +356,47 @@ def extract_page_meta(html_text: str, page_url: str) -> dict:
     context = " | ".join(context_parts) or "Brak dodatkowego kontekstu tekstowego."
 
     seen = set()
-    image_urls = []
-    for candidate in parser.image_candidates:
-        full_url = urljoin(page_url, candidate)
-        if _is_http_url(full_url) and full_url not in seen:
-            seen.add(full_url)
-            image_urls.append(full_url)
 
-    return {"context": context, "image_urls": image_urls, "title": title}
+    def add_candidates(raw_urls):
+        clean_urls = []
+        for raw_url in raw_urls:
+            clean = sanitize_image_url(raw_url, page_url)
+            if clean and not _is_svg_url(clean) and clean not in seen:
+                seen.add(clean)
+                clean_urls.append(clean)
+        return clean_urls
+
+    # Priority 1: OpenGraph / Twitter meta image.
+    meta_candidates = add_candidates(parser.meta_image_candidates)
+
+    # Priority 2: JSON-LD structured data (schema.org Product.image).
+    jsonld_image = _extract_jsonld_product_image(parser.ld_json_blocks)
+    jsonld_candidates = add_candidates([jsonld_image] if jsonld_image else [])
+
+    # Priority 3: a dedicated/eager-loaded <img> or one inside a gallery container.
+    priority_candidates = add_candidates(parser.priority_img_urls)
+
+    # Everything else on the page, queued as additional images.
+    body_images = []
+    for raw_url in parser.img_urls:
+        if len(seen) >= MAX_IMAGES_PER_PAGE:
+            break
+        body_images.extend(add_candidates([raw_url]))
+
+    ranked_main_candidates = meta_candidates + jsonld_candidates + priority_candidates
+    main_url = ranked_main_candidates[0] if ranked_main_candidates else (body_images[0] if body_images else None)
+
+    remaining = [u for u in ranked_main_candidates if u != main_url] + [u for u in body_images if u != main_url]
+    main_fallbacks = remaining
+    other_urls = remaining[:MAX_IMAGES_PER_PAGE]
+
+    return {
+        "context": context,
+        "title": title,
+        "main_url": main_url,
+        "main_fallbacks": main_fallbacks,
+        "other_urls": other_urls,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -310,38 +508,6 @@ def parse_url_list_text(raw_text: str) -> list:
 # ---------------------------------------------------------------------------
 
 MAX_URL_IMAGE_BYTES = 25 * 1024 * 1024
-
-
-def fetch_image_dimensions_fast(url: str):
-    """Reads image dimensions from just the first 4 KB (HTTP Range request),
-    so tiny icons can be rejected without downloading the whole file. Returns
-    (width, height) or None if the size couldn't be determined from the
-    partial data (in which case the caller falls back to a full download)."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return None
-    try:
-        _check_hostname_is_public(parsed.hostname)
-    except ValueError:
-        return None
-
-    try:
-        resp = requests.get(
-            url, stream=True, timeout=10, allow_redirects=False,
-            headers={"User-Agent": "AltTextGenerator/1.0", "Range": "bytes=0-4095"},
-        )
-        try:
-            if resp.status_code >= 300:
-                return None  # redirect or error - let the real download handle it safely
-            chunk = resp.raw.read(4096, decode_content=True) if resp.raw else b""
-            if not chunk:
-                chunk = resp.content[:4096]
-            with Image.open(io.BytesIO(chunk)) as img:
-                return img.size
-        finally:
-            resp.close()
-    except Exception:
-        return None
 
 
 def download_image_from_url(url: str, dest_dir: str) -> str:
@@ -555,17 +721,6 @@ def generate_alt_via_openai(image_path: str, context: str) -> str:
 
 
 def process_single_image(image_url: str, context: str, job_dir: str, fallback_urls: list = None) -> dict:
-    dims = fetch_image_dimensions_fast(image_url)
-    if dims is not None and (dims[0] < MIN_IMAGE_DIMENSION or dims[1] < MIN_IMAGE_DIMENSION):
-        return {
-            "image_url": image_url,
-            "context": context,
-            "alt": None,
-            "skipped": True,
-            "skip_reason": f"Pominięto - zbyt mała grafika ({dims[0]}x{dims[1]} px, prawdopodobnie ikona).",
-            "image_data": "",
-        }
-
     # og:image/twitter:image variants can point at the same photo under
     # different (hash-based) cache URLs - one of them 404-ing shouldn't sink
     # the whole image, so try each candidate in turn.
@@ -600,26 +755,52 @@ def process_single_image(image_url: str, context: str, job_dir: str, fallback_ur
     }
 
 
-def process_page_url(page_url: str, job_dir: str) -> dict:
-    """One full unit of work: fetch a product page, pull its title/main image
-    from meta tags, download the image and generate its ALT text."""
-    html_text, final_url = fetch_page_html(page_url)
-    meta = extract_page_meta(html_text, final_url)
-
-    if not meta["image_urls"]:
+def _process_image_safe(image_url: str, context: str, job_dir: str, fallback_urls: list = None) -> dict:
+    """process_single_image, but never raises - a failure on one image (main
+    or one of the "others") shouldn't take down the rest of the page."""
+    try:
+        return process_single_image(image_url, context, job_dir, fallback_urls=fallback_urls)
+    except Exception as e:
         return {
-            "page_url": page_url,
-            "image_url": "",
-            "context": meta["context"],
-            "alt": None,
-            "skipped": True,
-            "skip_reason": "Nie znaleziono obrazu głównego (brak og:image) na stronie.",
+            "image_url": image_url,
+            "context": context,
+            "alt": f"Błąd przetwarzania: {str(e)}",
+            "skipped": False,
+            "skip_reason": None,
             "image_data": "",
         }
 
-    primary, *fallback_urls = meta["image_urls"]
-    result = process_single_image(primary, meta["context"], job_dir, fallback_urls=fallback_urls)
-    result["page_url"] = page_url
+
+def process_page_url(page_url: str, job_dir: str) -> dict:
+    """One full unit of work: fetch a product page, pull every image on it
+    (main + the rest) from its markup, and generate an ALT for each one."""
+    html_text, final_url = fetch_page_html(page_url)
+    content = extract_page_content(html_text, final_url)
+
+    result = {
+        "page_url": page_url,
+        "context": content["context"],
+        "main_image": None,
+        "other_images": [],
+    }
+
+    if not content["main_url"]:
+        result["main_image"] = {
+            "image_url": "",
+            "context": content["context"],
+            "alt": None,
+            "skipped": True,
+            "skip_reason": "Nie znaleziono żadnej grafiki na stronie.",
+            "image_data": "",
+        }
+        return result
+
+    result["main_image"] = _process_image_safe(
+        content["main_url"], content["context"], job_dir, fallback_urls=content["main_fallbacks"]
+    )
+    for other_url in content["other_urls"]:
+        result["other_images"].append(_process_image_safe(other_url, content["context"], job_dir))
+
     return result
 
 
@@ -682,12 +863,12 @@ def background_worker(task_id: str, seed_urls: list, job_dir: str):
                 error_detail = str(e)
                 res = {
                     "page_url": page_url,
-                    "image_url": "",
                     "context": "",
-                    "alt": f"Błąd przetwarzania: {error_detail}",
-                    "skipped": False,
-                    "skip_reason": None,
-                    "image_data": "",
+                    "main_image": {
+                        "image_url": "", "context": "", "alt": f"Błąd przetwarzania: {error_detail}",
+                        "skipped": False, "skip_reason": None, "image_data": "",
+                    },
+                    "other_images": [],
                 }
 
             with JOBS_LOCK:
