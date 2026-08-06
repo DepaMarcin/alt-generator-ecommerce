@@ -146,41 +146,92 @@ _VOID_TAGS = {
 }
 
 # Real product-description containers, ranked best-match first - checked
-# against every open tag's itemprop/class/id/tag-name so the body's actual
+# against every open tag's itemprop/class/id so the body's actual
 # description text can be captured instead of the marketing-blurb meta
-# description ("Dobra cena", "Szybka wysyłka"...).
-DESCRIPTION_MAX_CHARS = 400
-_DESCRIPTION_CLASS_RANKS = (
-    ("product-description", 1),
-    ("description-content", 5),
-    ("description", 3),
-    ("product-info", 4),
+# description ("Dobra cena", "Szybka wysyłka"...). Deliberately precise (no
+# generic <article>/<main> fallback) - a broad fallback is exactly how
+# cross-sell/recommendation widget text used to leak into the context.
+DESCRIPTION_MAX_CHARS = 300
+_DESCRIPTION_ID_RANKS = (
+    ("description", 1),
+    ("product-description", 2),
+    ("tab-description", 5),
 )
+_DESCRIPTION_CLASS_RANKS = (
+    ("product-description", 3),
+    ("tab-content", 4),
+    ("description-content", 6),
+)
+
+# Cross-sell/recommendation/navigation containers to ignore entirely while
+# scanning for the description - these are the actual source of the
+# "wrong product's description ends up in the context" bug: a recommended-
+# products widget or "recently viewed" carousel can itself contain an
+# element that matches one of the description selectors above.
+_EXCLUDED_CONTAINER_CLASS_MARKERS = (
+    "cross-sell", "crosssell", "related", "related-products", "recommended",
+    "bestsellers", "recently-viewed", "product-slider", "carousel", "widget", "sidebar",
+)
+_EXCLUDED_CONTAINER_TAGS = {"header", "footer", "nav"}
+_EXCLUDED_CONTAINER_IDS = {"header", "footer"}
+
+# Marketing/price chrome that leaks in from nearby product-card/widget
+# fragments even inside an otherwise legitimate description container -
+# filtered out fragment-by-fragment rather than discarding the whole
+# description just because one sentence happens to mention a price.
+_DESCRIPTION_NOISE_PHRASES = (
+    "najniższa cena", "zł", "zobacz", "kup teraz", "darmowa dostawa",
+)
+
+
+def _is_excluded_description_container(tag: str, attrs_dict: dict) -> bool:
+    if tag in _EXCLUDED_CONTAINER_TAGS:
+        return True
+
+    elid = (attrs_dict.get("id") or "").strip().lower()
+    if elid in _EXCLUDED_CONTAINER_IDS:
+        return True
+
+    classes = (attrs_dict.get("class") or "").lower().split()
+    return any(marker in cls for cls in classes for marker in _EXCLUDED_CONTAINER_CLASS_MARKERS)
 
 
 def _description_container_rank(tag: str, attrs_dict: dict):
     """Returns the priority rank (lower = better) if this tag looks like a
-    product-description container, else None. Rank order: itemprop, then
-    class/id keywords roughly by specificity, then generic <article>/<main>."""
+    dedicated product-description container, else None. Rank order:
+    itemprop, then id/class keywords roughly by specificity."""
     itemprop = (attrs_dict.get("itemprop") or "").strip().lower()
     if itemprop == "description":
         return 0
 
     elid = (attrs_dict.get("id") or "").strip().lower()
-    if elid == "description":
-        return 2
+    for marker, rank in _DESCRIPTION_ID_RANKS:
+        if elid == marker:
+            return rank
 
     classes = (attrs_dict.get("class") or "").lower().split()
     for marker, rank in _DESCRIPTION_CLASS_RANKS:
         if marker in classes:
             return rank
 
-    if tag == "article":
-        return 6
-    if tag == "main":
-        return 7
-
     return None
+
+
+def _finalize_description_text(buffer: list) -> str:
+    """Joins a captured description container's raw text fragments,
+    dropping any individual fragment that looks like marketing/price noise
+    leaked in from nearby widget chrome (a price tag, a 'Kup teraz' button)
+    rather than discarding the whole description over one bad fragment."""
+    kept_fragments = []
+    for fragment in buffer:
+        collapsed = ' '.join(fragment.split())
+        if not collapsed:
+            continue
+        lowered = collapsed.lower()
+        if any(phrase in lowered for phrase in _DESCRIPTION_NOISE_PHRASES):
+            continue
+        kept_fragments.append(collapsed)
+    return ' '.join(kept_fragments)
 
 
 def _is_svg_url(url: str) -> bool:
@@ -229,10 +280,12 @@ def sanitize_image_url(raw_url, page_url: str):
     return text
 
 
-def _extract_jsonld_product_image(ld_json_blocks: list):
-    """Priority 2 of the main-image cascade: looks for a schema.org Product
-    node (optionally nested in an @graph array) inside <script
-    type="application/ld+json"> blocks and returns its "image" field."""
+def _find_jsonld_product_nodes(ld_json_blocks: list) -> list:
+    """Parses every <script type="application/ld+json"> block and returns
+    every schema.org Product node found (optionally nested in an @graph
+    array), in document order - shared by the main-image and description
+    cascades below."""
+    nodes = []
     for block in ld_json_blocks:
         block = block.strip()
         if not block:
@@ -255,16 +308,36 @@ def _extract_jsonld_product_image(ld_json_blocks: list):
                 continue
             item_type = item.get("@type")
             type_list = item_type if isinstance(item_type, list) else [item_type]
-            if not any(isinstance(t, str) and t.lower() == "product" for t in type_list):
-                continue
+            if any(isinstance(t, str) and t.lower() == "product" for t in type_list):
+                nodes.append(item)
 
-            image = item.get("image")
-            if isinstance(image, list) and image:
-                image = image[0]
-            if isinstance(image, dict):
-                image = image.get("url") or image.get("@id")
-            if isinstance(image, str) and image.strip():
-                return image.strip()
+    return nodes
+
+
+def _extract_jsonld_product_image(ld_json_blocks: list):
+    """Priority 2 of the main-image cascade: the first Product node's
+    "image" field."""
+    for item in _find_jsonld_product_nodes(ld_json_blocks):
+        image = item.get("image")
+        if isinstance(image, list) and image:
+            image = image[0]
+        if isinstance(image, dict):
+            image = image.get("url") or image.get("@id")
+        if isinstance(image, str) and image.strip():
+            return image.strip()
+
+    return None
+
+
+def _extract_jsonld_product_description(ld_json_blocks: list):
+    """Priority 1 of the description cascade: the first Product node's
+    "description" field - schema.org structured data is authored for that
+    exact product, so unlike scanning the body it can never leak text from a
+    cross-sell/recommendation widget elsewhere on the page."""
+    for item in _find_jsonld_product_nodes(ld_json_blocks):
+        description = item.get("description")
+        if isinstance(description, str) and description.strip():
+            return description.strip()
 
     return None
 
@@ -297,6 +370,7 @@ class _PageParser(HTMLParser):
         self._seen_priority_urls = set()
         self._container_stack = []  # bool per open non-void ancestor: "looks like a gallery"
         self._description_stack = []  # {"rank": int, "buffer": list} per open non-void ancestor
+        self._excluded_stack = []  # bool per open non-void ancestor: "cross-sell/nav/widget etc."
 
     def handle_starttag(self, tag, attrs):
         attrs_dict = dict(attrs)
@@ -306,7 +380,9 @@ class _PageParser(HTMLParser):
             any(marker in cls for cls in classes for marker in _GALLERY_CONTAINER_MARKERS)
             or any(marker in elid for marker in _GALLERY_CONTAINER_MARKERS)
         )
-        description_rank = _description_container_rank(tag, attrs_dict)
+        is_excluded_frame = _is_excluded_description_container(tag, attrs_dict)
+        currently_excluded = is_excluded_frame or any(self._excluded_stack)
+        description_rank = None if currently_excluded else _description_container_rank(tag, attrs_dict)
 
         if tag == "title":
             self._in_title = True
@@ -356,6 +432,7 @@ class _PageParser(HTMLParser):
             self._description_stack.append(
                 {"rank": description_rank, "buffer": []} if description_rank is not None else None
             )
+            self._excluded_stack.append(is_excluded_frame)
 
     def handle_endtag(self, tag):
         if tag == "title":
@@ -373,10 +450,12 @@ class _PageParser(HTMLParser):
         if tag not in _VOID_TAGS:
             if self._container_stack:
                 self._container_stack.pop()
+            if self._excluded_stack:
+                self._excluded_stack.pop()
             if self._description_stack:
                 frame = self._description_stack.pop()
                 if frame is not None and frame["rank"] not in self.description_candidates:
-                    text = ' '.join(''.join(frame["buffer"]).split())
+                    text = _finalize_description_text(frame["buffer"])
                     if text:
                         self.description_candidates[frame["rank"]] = text
 
@@ -393,13 +472,22 @@ class _PageParser(HTMLParser):
 
 
 def extract_page_content(html_text: str, page_url: str) -> dict:
-    """Pulls the page context (H1/og:title + the real body description text)
-    plus every image on the page. The title prefers the visible <h1>, falling
-    back to og:title then <title>. The description is pulled from an actual
-    product-description container in the body (itemprop="description",
-    .product-description, #description, .description, .product-info,
-    .description-content, <article>, <main>) - NOT the SEO meta description,
-    which is usually marketing filler rather than real product knowledge.
+    """Pulls the page context (H1/og:title + a description that belongs to
+    THIS product only) plus every image on the page. The title prefers the
+    visible <h1>, falling back to og:title then <title>.
+
+    The description follows a cascade, strongest/safest signal first:
+    (1) schema.org Product.description from JSON-LD - authored for exactly
+    this product, so it can never leak cross-sell/recommendation text;
+    (2) failing that, a dedicated description container in the body
+    (itemprop="description", #description, #product-description,
+    .product-description, .tab-content, #tab-description,
+    .description-content) - with cross-sell/related/recommended/carousel/
+    widget/sidebar/header/footer/nav containers explicitly excluded from the
+    scan, and marketing/price fragments ("zł", "Kup teraz", ...) dropped
+    from whatever text is captured. NOT the SEO meta description, which is
+    usually marketing filler rather than real product knowledge.
+
     The main image is picked via a cascade, strongest signal first: (1)
     og:image/twitter:image meta tags, (2) JSON-LD Product.image, (3) an <img>
     hinted as high-priority/eager or sitting inside a gallery container -
@@ -416,16 +504,22 @@ def extract_page_content(html_text: str, page_url: str) -> dict:
 
     title = re.sub(r'\s+', ' ', (parser.h1 or parser.og_title or parser.title or "").strip())
 
-    body_description = ""
-    if parser.description_candidates:
-        best_rank = min(parser.description_candidates)
-        body_description = parser.description_candidates[best_rank][:DESCRIPTION_MAX_CHARS].strip()
+    # Priority 1: schema.org Product.description from JSON-LD.
+    jsonld_description = _extract_jsonld_product_description(parser.ld_json_blocks)
+    if jsonld_description:
+        description = re.sub(r'\s+', ' ', jsonld_description)[:DESCRIPTION_MAX_CHARS].strip()
+    else:
+        # Priority 2: a dedicated description container in the body.
+        description = ""
+        if parser.description_candidates:
+            best_rank = min(parser.description_candidates)
+            description = parser.description_candidates[best_rank][:DESCRIPTION_MAX_CHARS].strip()
 
     context_parts = []
     if title:
         context_parts.append(f"Produkt: {title}")
-    if body_description:
-        context_parts.append(f"Opis z body: {body_description}")
+    if description:
+        context_parts.append(f"Opis: {description}")
     context = " | ".join(context_parts) or "Brak dodatkowego kontekstu tekstowego."
 
     seen = set()

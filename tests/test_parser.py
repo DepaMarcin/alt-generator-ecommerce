@@ -52,7 +52,7 @@ class TestMainImageCascade:
 class TestBodyDescriptionExtraction:
     def test_uses_product_description_container_not_meta_description(self, html_with_body_description):
         content = app.extract_page_content(html_with_body_description, "https://sklep.pl/otibiom")
-        assert "Opis z body:" in content["context"]
+        assert "Opis:" in content["context"]
         assert "probiotyczny" in content["context"]
         assert "Dobra Cena" not in content["context"]
         assert "Szybka wysylka" not in content["context"]
@@ -61,19 +61,19 @@ class TestBodyDescriptionExtraction:
         content = app.extract_page_content(html_with_body_description, "https://sklep.pl/otibiom")
         assert content["title"] == "Otibiom krople do uszu 15ml"
 
-    def test_itemprop_description_has_priority_over_generic_class(self):
+    def test_itemprop_description_has_priority_over_id_description(self):
         html = """
         <html><head><title>Fallback</title></head><body>
         <h1>Produkt testowy</h1>
-        <div class="description">Ogolny opis w klasie description.</div>
+        <div id="description">Ogolny opis w kontenerze #description.</div>
         <div itemprop="description">Dokladny opis w itemprop, powinien wygrac.</div>
         </body></html>
         """
         content = app.extract_page_content(html, "https://sklep.pl/produkt")
         assert "Dokladny opis w itemprop" in content["context"]
-        assert "Ogolny opis w klasie" not in content["context"]
+        assert "Ogolny opis w kontenerze" not in content["context"]
 
-    def test_no_description_container_omits_body_description_segment(self):
+    def test_no_description_container_omits_description_segment(self):
         html = """
         <html><head><title>Fallback</title></head><body>
         <h1>Produkt bez opisu</h1>
@@ -81,7 +81,7 @@ class TestBodyDescriptionExtraction:
         </body></html>
         """
         content = app.extract_page_content(html, "https://sklep.pl/produkt")
-        assert "Opis z body" not in content["context"]
+        assert "Opis:" not in content["context"]
         assert content["context"] == "Produkt: Produkt bez opisu"
 
     def test_description_is_truncated_to_max_chars(self):
@@ -89,12 +89,83 @@ class TestBodyDescriptionExtraction:
         html = f"""
         <html><head><title>Fallback</title></head><body>
         <h1>Dlugi opis</h1>
-        <div class="description">{long_text}</div>
+        <div class="product-description">{long_text}</div>
         </body></html>
         """
         content = app.extract_page_content(html, "https://sklep.pl/produkt")
-        desc_part = content["context"].split("Opis z body: ")[1]
+        desc_part = content["context"].split("Opis: ")[1]
         assert len(desc_part) <= app.DESCRIPTION_MAX_CHARS
+
+
+class TestDescriptionContextLeakPrevention:
+    """Regression coverage for the "wrong product's description leaks into
+    the context" bug: a recommended-products/cross-sell/carousel widget
+    elsewhere on the page must never contribute to the extracted context."""
+
+    def test_jsonld_product_description_is_used_when_available(self):
+        html = """
+        <html><head><title>Fallback</title>
+        <script type="application/ld+json">
+        {"@context": "https://schema.org", "@type": "Product", "name": "Krzeselko do karmienia",
+         "description": "Krzeselko do karmienia regulowane na 6 poziomow wysokosci, tacka zdejmowana."}
+        </script>
+        </head><body>
+        <h1>Krzeselko do karmienia</h1>
+        <div class="recommended">
+          <h3>Polecane produkty</h3>
+          <p class="product-description">Wozek spacerowy Cybex Priam - najlepsza cena, kup teraz!</p>
+        </div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/krzeselko")
+        assert "Opis: Krzeselko do karmienia regulowane" in content["context"]
+        assert "Wozek spacerowy Cybex" not in content["context"]
+
+    def test_recommended_and_cross_sell_blocks_are_ignored_in_favor_of_product_description(self):
+        html = """
+        <html><head><title>Fallback</title></head><body>
+        <h1>Krzeselko do karmienia</h1>
+
+        <div class="recently-viewed">
+          <p class="description-content">Ostatnio ogladane: Wozek spacerowy Cybex Priam, zobacz teraz.</p>
+        </div>
+
+        <div class="cross-sell">
+          <div id="product-description">Fotelik samochodowy Maxi-Cosi - darmowa dostawa!</div>
+        </div>
+
+        <aside class="sidebar">
+          <div class="product-description">Bestsellery: Gondola dzieciecia - najnizsza cena 199 zl.</div>
+        </aside>
+
+        <div id="product-description">
+          Krzeselko do karmienia z regulacja wysokosci, tacka zdejmowana, rama aluminiowa.
+        </div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/krzeselko")
+        assert "Krzeselko do karmienia z regulacja wysokosci" in content["context"]
+        assert "Wozek spacerowy Cybex" not in content["context"]
+        assert "Fotelik samochodowy" not in content["context"]
+        assert "Gondola dzieciecia" not in content["context"]
+
+    def test_marketing_and_price_noise_fragments_are_stripped(self):
+        html = """
+        <html><head><title>Fallback</title></head><body>
+        <h1>Krzeselko do karmienia</h1>
+        <div id="product-description">
+          <p>Krzeselko do karmienia z regulacja wysokosci i zdejmowana tacka.</p>
+          <span>Najnizsza cena: 249 zł</span>
+          <button>Kup teraz</button>
+          <p>Darmowa dostawa od 200 zł</p>
+        </div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/krzeselko")
+        assert "Krzeselko do karmienia z regulacja wysokosci" in content["context"]
+        assert "249" not in content["context"]
+        assert "Kup teraz" not in content["context"]
+        assert "Darmowa dostawa" not in content["context"]
 
 
 class TestFetchPageHtmlWithMockedRequests:
