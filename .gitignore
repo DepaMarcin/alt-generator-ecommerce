@@ -5,4 +5,5 @@ test.jpg
 *.7z
 tmp_uploads/
 __pycache__/
+.pytest_cache/
 .env

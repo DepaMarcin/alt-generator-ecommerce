@@ -145,6 +145,43 @@ _VOID_TAGS = {
     "link", "meta", "param", "source", "track", "wbr",
 }
 
+# Real product-description containers, ranked best-match first - checked
+# against every open tag's itemprop/class/id/tag-name so the body's actual
+# description text can be captured instead of the marketing-blurb meta
+# description ("Dobra cena", "Szybka wysyłka"...).
+DESCRIPTION_MAX_CHARS = 400
+_DESCRIPTION_CLASS_RANKS = (
+    ("product-description", 1),
+    ("description-content", 5),
+    ("description", 3),
+    ("product-info", 4),
+)
+
+
+def _description_container_rank(tag: str, attrs_dict: dict):
+    """Returns the priority rank (lower = better) if this tag looks like a
+    product-description container, else None. Rank order: itemprop, then
+    class/id keywords roughly by specificity, then generic <article>/<main>."""
+    itemprop = (attrs_dict.get("itemprop") or "").strip().lower()
+    if itemprop == "description":
+        return 0
+
+    elid = (attrs_dict.get("id") or "").strip().lower()
+    if elid == "description":
+        return 2
+
+    classes = (attrs_dict.get("class") or "").lower().split()
+    for marker, rank in _DESCRIPTION_CLASS_RANKS:
+        if marker in classes:
+            return rank
+
+    if tag == "article":
+        return 6
+    if tag == "main":
+        return 7
+
+    return None
+
 
 def _is_svg_url(url: str) -> bool:
     return urlparse(url).path.lower().endswith(".svg")
@@ -233,26 +270,33 @@ def _extract_jsonld_product_image(ld_json_blocks: list):
 
 
 class _PageParser(HTMLParser):
-    """Single pass over the page: captures <title>/og:title/og:description
-    (context), the main-image cascade signals (og:image/twitter:image,
-    JSON-LD Product.image, fetchpriority/eager/gallery <img> hints), AND
-    every <img> tag actually rendered on the page (so nothing gets missed)."""
+    """Single pass over the page: captures <title>/<h1>/og:title (title
+    context), the actual body description text (from a product-description
+    container - never the SEO meta description), the main-image cascade
+    signals (og:image/twitter:image, JSON-LD Product.image, fetchpriority/
+    eager/gallery <img> hints), AND every <img> tag actually rendered on the
+    page (so nothing gets missed)."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.title = ""
         self.og_title = ""
-        self.og_description = ""
+        self.h1 = ""
         self.meta_image_candidates = []
         self.img_urls = []
         self.priority_img_urls = []
         self.ld_json_blocks = []
+        self.description_candidates = {}  # rank -> first captured text for that rank
         self._in_title = False
+        self._in_h1 = False
+        self._h1_done = False
+        self._h1_buffer = []
         self._in_ldjson = False
         self._ldjson_buffer = ""
         self._seen_img_urls = set()
         self._seen_priority_urls = set()
         self._container_stack = []  # bool per open non-void ancestor: "looks like a gallery"
+        self._description_stack = []  # {"rank": int, "buffer": list} per open non-void ancestor
 
     def handle_starttag(self, tag, attrs):
         attrs_dict = dict(attrs)
@@ -262,9 +306,12 @@ class _PageParser(HTMLParser):
             any(marker in cls for cls in classes for marker in _GALLERY_CONTAINER_MARKERS)
             or any(marker in elid for marker in _GALLERY_CONTAINER_MARKERS)
         )
+        description_rank = _description_container_rank(tag, attrs_dict)
 
         if tag == "title":
             self._in_title = True
+        elif tag == "h1" and not self._h1_done:
+            self._in_h1 = True
         elif tag == "script":
             script_type = (attrs_dict.get("type") or "").strip().lower()
             if script_type == "application/ld+json":
@@ -273,14 +320,11 @@ class _PageParser(HTMLParser):
         elif tag == "meta":
             key = (attrs_dict.get("property") or attrs_dict.get("name") or "").strip().lower()
             content = (attrs_dict.get("content") or "").strip()
-            if content:
-                if key == "og:title" and not self.og_title:
-                    self.og_title = content
-                elif key == "og:description" and not self.og_description:
-                    self.og_description = content
-                elif key in _META_IMAGE_KEYS and not content.startswith("data:"):
-                    if content not in self.meta_image_candidates:
-                        self.meta_image_candidates.append(content)
+            if content and key == "og:title" and not self.og_title:
+                self.og_title = content
+            elif content and key in _META_IMAGE_KEYS and not content.startswith("data:"):
+                if content not in self.meta_image_candidates:
+                    self.meta_image_candidates.append(content)
         elif tag == "img":
             chosen = None
             for attr in IMG_SRC_ATTR_PRIORITY:
@@ -309,50 +353,79 @@ class _PageParser(HTMLParser):
 
         if tag not in _VOID_TAGS:
             self._container_stack.append(is_gallery_frame)
+            self._description_stack.append(
+                {"rank": description_rank, "buffer": []} if description_rank is not None else None
+            )
 
     def handle_endtag(self, tag):
         if tag == "title":
             self._in_title = False
+        elif tag == "h1":
+            if self._in_h1:
+                self.h1 = ' '.join(''.join(self._h1_buffer).split())
+                self._in_h1 = False
+                self._h1_done = True
         elif tag == "script":
             if self._in_ldjson:
                 self.ld_json_blocks.append(self._ldjson_buffer)
             self._in_ldjson = False
 
-        if tag not in _VOID_TAGS and self._container_stack:
-            self._container_stack.pop()
+        if tag not in _VOID_TAGS:
+            if self._container_stack:
+                self._container_stack.pop()
+            if self._description_stack:
+                frame = self._description_stack.pop()
+                if frame is not None and frame["rank"] not in self.description_candidates:
+                    text = ' '.join(''.join(frame["buffer"]).split())
+                    if text:
+                        self.description_candidates[frame["rank"]] = text
 
     def handle_data(self, data):
         if self._in_title:
             self.title += data
-        elif self._in_ldjson:
+        if self._in_h1:
+            self._h1_buffer.append(data)
+        if self._in_ldjson:
             self._ldjson_buffer += data
+        for frame in self._description_stack:
+            if frame is not None:
+                frame["buffer"].append(data)
 
 
 def extract_page_content(html_text: str, page_url: str) -> dict:
-    """Pulls the page context (og:title/description) plus every image on the
-    page. The main image is picked via a cascade, strongest signal first:
-    (1) og:image/twitter:image meta tags, (2) JSON-LD Product.image,
-    (3) an <img> hinted as high-priority/eager or sitting inside a gallery
-    container - falling back to the first <img> on the page if none of that
-    is present. Every candidate URL is sanitized/decoded/resolved to an
-    absolute http(s) URL before use. SVG icons are excluded - everything
-    else (including small graphics) is kept, since size alone isn't a
-    reliable signal of relevance here."""
+    """Pulls the page context (H1/og:title + the real body description text)
+    plus every image on the page. The title prefers the visible <h1>, falling
+    back to og:title then <title>. The description is pulled from an actual
+    product-description container in the body (itemprop="description",
+    .product-description, #description, .description, .product-info,
+    .description-content, <article>, <main>) - NOT the SEO meta description,
+    which is usually marketing filler rather than real product knowledge.
+    The main image is picked via a cascade, strongest signal first: (1)
+    og:image/twitter:image meta tags, (2) JSON-LD Product.image, (3) an <img>
+    hinted as high-priority/eager or sitting inside a gallery container -
+    falling back to the first <img> on the page if none of that is present.
+    Every candidate URL is sanitized/decoded/resolved to an absolute http(s)
+    URL before use. SVG icons are excluded - everything else (including
+    small graphics) is kept, since size alone isn't a reliable signal of
+    relevance here."""
     parser = _PageParser()
     try:
         parser.feed(html_text)
     except Exception:
         pass  # tolerate malformed markup - keep whatever was parsed so far
 
-    title = re.sub(r'\s+', ' ', (parser.og_title or parser.title or "").strip())
+    title = re.sub(r'\s+', ' ', (parser.h1 or parser.og_title or parser.title or "").strip())
+
+    body_description = ""
+    if parser.description_candidates:
+        best_rank = min(parser.description_candidates)
+        body_description = parser.description_candidates[best_rank][:DESCRIPTION_MAX_CHARS].strip()
 
     context_parts = []
     if title:
         context_parts.append(f"Produkt: {title}")
-    if parser.og_description:
-        desc = re.sub(r'\s+', ' ', parser.og_description.strip())[:200]
-        if desc:
-            context_parts.append(f"Opis: {desc}")
+    if body_description:
+        context_parts.append(f"Opis z body: {body_description}")
     context = " | ".join(context_parts) or "Brak dodatkowego kontekstu tekstowego."
 
     seen = set()
@@ -612,50 +685,41 @@ OPENAI_TIMEOUT_SECONDS = 60
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=OPENAI_TIMEOUT_SECONDS)
 
 ALT_TEXT_SYSTEM_PROMPT = (
-    "Jesteś ekspertem SEO i WCAG dla sklepów e-commerce. Twoim zadaniem jest tworzenie "
-    "opisów ALT do zdjęć na stronach produktowych.\n\n"
-    "ZASADY GENEROWANIA ALT:\n"
-    "1. PIERWSZEŃSTWO MA TO, CO WIDAĆ NA ZDJĘCIU:\n"
-    "   - Zidentyfikuj główny obiekt na grafice.\n"
-    "   - Jeśli zdjęcie przedstawia AKCESORIUM lub CZĘŚĆ (np. uchwyt na kubek, adaptery, "
-    "moskitierę, koła, torbę) - opisz w pierwszej kolejności to akcesorium (np. 'Czarny "
-    "uchwyt na napój montowany na ramie wózka'), a NIE wklejaj na początku pełnej nazwy "
-    "głównego produktu ze strony.\n"
-    "   - Jeśli zdjęcie przedstawia INNY PRODUKT / KATEGORIĘ (np. fotelik samochodowy) - "
-    "opisz ten produkt (np. 'Fotelik samochodowy dla niemowląt w samochodzie').\n"
-    "   - Jeśli zdjęcie przedstawia GŁÓWNY PRODUKT w całości - opisz go z uwzględnieniem "
-    "koloru, wariantu lub ustawienia (np. 'Wózek dziecięcy głęboki Cybex Priam z beżową "
-    "budką').\n"
-    "2. ZAKAZ SZTYWNEGO PATRZENIA NA PATTERN / TEMPLATE:\n"
-    "   - NIE ZACZYNAJ każdego opisu od tej samej, sztywnej sekwencji słów z kontekstu!\n"
-    "   - Używaj nazwy marki (np. Cybex) lub modelu (np. Priam) w sposób naturalny w "
-    "zdaniu, nie zawsze na początku.\n"
-    "   - Różnicuj strukturę zdań między kolejnymi opisami (raz 'Czarny wózek 2w1...', "
-    "innym razem 'Wózek spacerowy Cybex w kolorze czarnym', a przy dodatkach 'Moskitiera "
-    "dedykowana do gondoli wózka').\n"
-    "3. WYMOGI FORMALNE:\n"
-    "   - Opis ma być zwięzły: 4-12 słów, maksymalnie 120 znaków.\n"
+    "Jesteś ekspertem SEO i WCAG dla sklepów e-commerce. Otrzymujesz zdjęcie oraz opis "
+    "produktu wyciągnięty z treści strony (body).\n\n"
+    "ZASADY ANALIZY I GENEROWANIA ALT:\n"
+    "1. OCENA POWIĄZANIA GRAFIKI Z PRODUKTEM:\n"
+    "   - Przed wygenerowaniem opisu oceń, czy grafika przedstawia PRODUKT (lub jego "
+    "część/użycie), czy jest to GRAFIKA NIEZWIĄZANA / ELEMENT UNIWERSALNY (np. logo "
+    "sklepu, ikona dostawy, baner płatności, certyfikat, grafika ozdobna).\n"
+    "2. JEŚLI GRAFIKA JEST ZWIĄZANA Z PRODUKTEM:\n"
+    "   - Wykorzystaj opis z body jako wskazówkę, czym dokładnie jest przedmiot (np. "
+    "forma preparatu, przeznaczenie, składnik, sposób użycia).\n"
+    "   - Stwórz precyzyjny ALT opisujący to, co widać (np. 'Opakowanie preparatu "
+    "probiotycznego Otibiom w kapsułkach do pielęgnacji uszu psa').\n"
+    "   - NIE ZACZYNAJ każdego opisu od tej samej, sztywnej sekwencji słów z opisu - "
+    "wpleć markę/model naturalnie w zdanie (nie zawsze na początku) i różnicuj strukturę "
+    "zdań między kolejnymi zdjęciami.\n"
+    "3. JEŚLI GRAFIKA NIE JEST ZWIĄZANA Z PRODUKTEM:\n"
+    "   - ABSOLUTNY ZAKAZ dodawania informacji z opisu produktu lub nazwy produktu!\n"
+    "   - Opisz WYŁĄCZNIE to, co jest na obrazku (np. 'Logo sklepu Zooclick', 'Ikona "
+    "darmowej dostawy powyżej 100 zł', 'Płatność kartą Visa i Mastercard').\n"
+    "4. WYMOGI FORMALNE:\n"
+    "   - Zwięźle: 4-12 słów, maksymalnie 120 znaków.\n"
     "   - Pisz po polsku, poprawnie gramatycznie i naturalnie dla człowieka, z poprawnymi "
     "znakami diakrytycznymi.\n"
     "   - Brak zwrotów typu 'Zdjęcie przedstawia', 'Obrazek z', 'Grafika'.\n"
     "   - Odpowiadasz WYŁĄCZNIE gotowym tekstem alt, bez cudzysłowów, bez prefiksów typu "
-    "'Alt:', bez pytań i komentarzy.\n\n"
-    "PRZYKŁADY DOBRYCH PRZEKSZTAŁCEŃ:\n"
-    "- Zamiast: 'Cybex PRIAM 5.0 COMFORT wózek 2w1 uchwyt na kubek'\n"
-    "  -> Dobrze: 'Czarny uchwyt na kubek zamontowany na ramie wózka Cybex'\n"
-    "- Zamiast: 'Cybex PRIAM 5.0 COMFORT wózek 2w1 akcesoria montażowe'\n"
-    "  -> Dobrze: 'Adaptery do montażu fotelika na stelażu wózka'\n"
-    "- Zamiast: 'Cybex PRIAM 5.0 COMFORT wózek 2w1 w kolorze czarnym'\n"
-    "  -> Dobrze: 'Spacerówka Cybex Priam z czarnym siedziskiem i ramą'"
+    "'Alt:', bez pytań i komentarzy."
 )
 
 ALT_TEXT_PROMPT_TEMPLATE = (
-    "KONTEKST STRONY (informacja pomocnicza, wyciągnięta automatycznie z podstrony - "
-    "wykorzystaj ją sprytnie i elastycznie, nie kopiuj jej dosłownie na początek zdania): "
-    "{context}\n\n"
-    "Przeanalizuj załączone zdjęcie i stwórz do niego tekst ALT zgodnie z zasadami z "
-    "instrukcji systemowej - w pierwszej kolejności opisz to, co faktycznie widać na "
-    "zdjęciu."
+    "OPIS PRODUKTU Z TREŚCI STRONY (informacja pomocnicza, wyciągnięta automatycznie z "
+    "sekcji opisu produktu w body - NIE z meta description - wykorzystaj ją tylko jeśli "
+    "grafika faktycznie przedstawia produkt): {context}\n\n"
+    "Przeanalizuj załączone zdjęcie: najpierw oceń, czy jest ono związane z produktem, "
+    "czy jest elementem uniwersalnym/niezwiązanym (logo, ikona, baner, certyfikat), a "
+    "następnie stwórz do niego tekst ALT zgodnie z zasadami z instrukcji systemowej."
 )
 
 # Shared "cooldown" between worker threads so a burst of 429s doesn't cause every
