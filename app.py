@@ -29,11 +29,16 @@ app = Flask(__name__)
 # no more multi-gigabyte HTML dumps, so a generous-but-sane cap is enough.
 MAX_CONTENT_LENGTH_MB = 16
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH_MB * 1024 * 1024
-JOB_MAX_AGE_SECONDS = 3600      # Job retention time in memory (1h)
+JOB_MAX_AGE_SECONDS = 7200       # Job retention time in memory (2h) - long batches must never expire mid-run
 MAX_WORKERS = 5                  # Number of parallel connections (page fetch + OpenAI)
+PAGE_IMAGE_WORKERS = 3            # Concurrent image downloads+ALT generations *within* a single page
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+# Statuses a job never leaves on its own - background_worker is done touching
+# it once it's in one of these, so it's the only point clean_old_jobs() is
+# allowed to reap it from.
+FINISHED_JOB_STATUSES = {"completed", "error", "stopped_error"}
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 TMP_UPLOADS_DIR = os.path.join(PROJECT_DIR, "tmp_uploads")
@@ -911,7 +916,39 @@ def generate_alt_via_openai(image_path: str, context: str) -> str:
     return alt.strip('"').strip("'").strip()
 
 
-def process_single_image(image_url: str, context: str, job_dir: str, fallback_urls: list = None) -> dict:
+def _get_cached_image_result(task_id: str, image_url: str):
+    """Returns a copy of a previously-generated result for this exact image
+    URL within the same job, if any. A shared asset (logo, delivery icon,
+    payment banner) that repeats across many product pages in the same
+    batch then skips the download + OpenAI call entirely on every repeat
+    after the first - 0 ms, 0 API requests. Safe to call from any worker
+    thread: only the dict lookup happens under JOBS_LOCK, never the slow
+    network/API work."""
+    if not task_id:
+        return None
+    with JOBS_LOCK:
+        job = JOBS.get(task_id)
+        if not job:
+            return None
+        cached = job.get("image_cache", {}).get(image_url)
+        return dict(cached) if cached is not None else None
+
+
+def _store_cached_image_result(task_id: str, image_url: str, result: dict):
+    if not task_id:
+        return
+    with JOBS_LOCK:
+        job = JOBS.get(task_id)
+        if job is not None:
+            job.setdefault("image_cache", {})[image_url] = dict(result)
+
+
+def process_single_image(image_url: str, context: str, job_dir: str, fallback_urls: list = None,
+                          task_id: str = None) -> dict:
+    cached = _get_cached_image_result(task_id, image_url)
+    if cached is not None:
+        return cached
+
     # og:image/twitter:image variants can point at the same photo under
     # different (hash-based) cache URLs - one of them 404-ing shouldn't sink
     # the whole image, so try each candidate in turn.
@@ -936,7 +973,7 @@ def process_single_image(image_url: str, context: str, job_dir: str, fallback_ur
     with open(compressed_path, "rb") as f:
         encoded_image = base64.b64encode(f.read()).decode("utf-8")
 
-    return {
+    result = {
         "image_url": used_url,
         "context": context,
         "alt": alt_text,
@@ -944,13 +981,18 @@ def process_single_image(image_url: str, context: str, job_dir: str, fallback_ur
         "skip_reason": None,
         "image_data": f"data:{media_type};base64,{encoded_image}",
     }
+    # Only successful results are cached - a transient download/API failure
+    # shouldn't poison every later page that happens to share the URL.
+    _store_cached_image_result(task_id, image_url, result)
+    return result
 
 
-def _process_image_safe(image_url: str, context: str, job_dir: str, fallback_urls: list = None) -> dict:
+def _process_image_safe(image_url: str, context: str, job_dir: str, fallback_urls: list = None,
+                         task_id: str = None) -> dict:
     """process_single_image, but never raises - a failure on one image (main
     or one of the "others") shouldn't take down the rest of the page."""
     try:
-        return process_single_image(image_url, context, job_dir, fallback_urls=fallback_urls)
+        return process_single_image(image_url, context, job_dir, fallback_urls=fallback_urls, task_id=task_id)
     except Exception as e:
         return {
             "image_url": image_url,
@@ -962,9 +1004,13 @@ def _process_image_safe(image_url: str, context: str, job_dir: str, fallback_url
         }
 
 
-def process_page_url(page_url: str, job_dir: str) -> dict:
+def process_page_url(page_url: str, job_dir: str, task_id: str = None) -> dict:
     """One full unit of work: fetch a product page, pull every image on it
-    (main + the rest) from its markup, and generate an ALT for each one."""
+    (main + the rest) from its markup, and generate an ALT for each one.
+    The main image is processed first, then the remaining images are
+    processed concurrently (up to PAGE_IMAGE_WORKERS at a time) - each
+    candidate is checked against the job's shared image_cache first, so an
+    asset that repeats across pages is only ever downloaded/analyzed once."""
     html_text, final_url = fetch_page_html(page_url)
     content = extract_page_content(html_text, final_url)
 
@@ -987,10 +1033,19 @@ def process_page_url(page_url: str, job_dir: str) -> dict:
         return result
 
     result["main_image"] = _process_image_safe(
-        content["main_url"], content["context"], job_dir, fallback_urls=content["main_fallbacks"]
+        content["main_url"], content["context"], job_dir,
+        fallback_urls=content["main_fallbacks"], task_id=task_id,
     )
-    for other_url in content["other_urls"]:
-        result["other_images"].append(_process_image_safe(other_url, content["context"], job_dir))
+
+    other_urls = content["other_urls"]
+    if other_urls:
+        with ThreadPoolExecutor(max_workers=min(PAGE_IMAGE_WORKERS, len(other_urls))) as page_executor:
+            # executor.map preserves input order in its output, so results
+            # still line up with other_urls despite running concurrently.
+            result["other_images"] = list(page_executor.map(
+                lambda u: _process_image_safe(u, content["context"], job_dir, task_id=task_id),
+                other_urls,
+            ))
 
     return result
 
@@ -1000,11 +1055,20 @@ def process_page_url(page_url: str, job_dir: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def clean_old_jobs():
+    """Reaps only jobs that have actually finished (status in
+    FINISHED_JOB_STATUSES) AND are older than JOB_MAX_AGE_SECONDS. A job
+    still 'parsing'/'processing' is never removed here, no matter its age -
+    deleting it out from under a still-running background_worker thread is
+    exactly what caused 404s ("Zadanie nie istnieje lub wygasło") on jobs
+    that were still actively working. A finished job also stays in JOBS
+    until this age cutoff, so the frontend always has time to poll the
+    final 'completed' status before it's cleaned up."""
     now = time.time()
     with JOBS_LOCK:
         expired_ids = [
             t_id for t_id, job in JOBS.items()
-            if now - job.get("created_at", now) > JOB_MAX_AGE_SECONDS
+            if job.get("status") in FINISHED_JOB_STATUSES
+            and now - job.get("created_at", now) > JOB_MAX_AGE_SECONDS
         ]
         for t_id in expired_ids:
             del JOBS[t_id]
@@ -1048,7 +1112,7 @@ def background_worker(task_id: str, seed_urls: list, job_dir: str):
             is_error = False
             error_detail = None
             try:
-                res = process_page_url(page_url, job_dir)
+                res = process_page_url(page_url, job_dir, task_id=task_id)
             except Exception as e:
                 is_error = True
                 error_detail = str(e)
@@ -1069,6 +1133,10 @@ def background_worker(task_id: str, seed_urls: list, job_dir: str):
                 JOBS[task_id]["results"].append(res)
                 JOBS[task_id]["processed"] += 1
 
+                # consecutive_errors is read/incremented/reset exclusively
+                # inside this JOBS_LOCK block - multiple worker_task threads
+                # run concurrently, so mutating it outside the lock would be
+                # a race condition.
                 if is_error:
                     JOBS[task_id]["error_count"] += 1
                     consecutive_errors += 1
@@ -1170,6 +1238,7 @@ def generate_alt():
             "results": [],
             "error_message": None,
             "created_at": time.time(),
+            "image_cache": {},  # image_url -> already-generated result, deduped across pages in this batch
         }
 
     thread = threading.Thread(target=background_worker, args=(task_id, seed_urls, job_dir))
@@ -1185,11 +1254,14 @@ def get_status(task_id):
 
     with JOBS_LOCK:
         job = JOBS.get(task_id)
+        if not job:
+            return jsonify({"error": "Zadanie nie istnieje lub wygasło."}), 404
+        # image_cache is an internal dedup structure (can hold duplicate
+        # base64 image blobs) - never worth shipping to the frontend on
+        # every poll, it would just bloat the response and slow polling down.
+        public_job = {k: v for k, v in job.items() if k != "image_cache"}
 
-    if not job:
-        return jsonify({"error": "Zadanie nie istnieje lub wygasło."}), 404
-
-    return jsonify(job)
+    return jsonify(public_job)
 
 
 if __name__ == '__main__':
