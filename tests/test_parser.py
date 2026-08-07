@@ -13,8 +13,8 @@ class TestMainImageCascade:
     def test_priority_3_eager_or_gallery_img(self, html_with_gallery_img_only):
         content = app.extract_page_content(html_with_gallery_img_only, "https://sklep.pl/produkt")
         assert content["main_url"] == "https://cdn.sklep.pl/img/gallery-main.jpg"
-        assert "https://cdn.sklep.pl/img/header-logo.jpg" in content["other_urls"]
-        assert "https://cdn.sklep.pl/img/footer-banner.jpg" in content["other_urls"]
+        assert "https://cdn.sklep.pl/img/top-of-page-photo.jpg" in content["other_urls"]
+        assert "https://cdn.sklep.pl/img/bottom-of-page-photo.jpg" in content["other_urls"]
 
     def test_priority_3_fetchpriority_high_attribute(self):
         html = """
@@ -47,6 +47,111 @@ class TestMainImageCascade:
         """
         content = app.extract_page_content(html, "https://sklep.pl/produkt")
         assert content["main_url"] == "https://cdn.sklep.pl/img/real-photo.jpg"
+
+
+class TestJunkImageFilter:
+    def test_is_junk_image_flags_known_keywords(self):
+        assert app._is_junk_image("https://cdn.sklep.pl/img/store-logo.png") is True
+        assert app._is_junk_image("https://cdn.sklep.pl/icons/payment-visa.svg") is True
+        assert app._is_junk_image("https://cdn.sklep.pl/img/inpost-delivery.png") is True
+        assert app._is_junk_image("https://cdn.sklep.pl/img/facebook-share.png") is True
+
+    def test_is_junk_image_passes_a_normal_product_photo_url(self):
+        assert app._is_junk_image("https://cdn.sklep.pl/img/cybex-priam-front.jpg") is False
+
+    def test_is_junk_image_flags_small_width_or_height_attribute(self):
+        assert app._is_junk_image("https://cdn.sklep.pl/img/photo.jpg", {"width": "40"}) is True
+        assert app._is_junk_image("https://cdn.sklep.pl/img/photo.jpg", {"height": "60px"}) is True
+
+    def test_is_junk_image_ignores_non_numeric_size_attributes(self):
+        assert app._is_junk_image("https://cdn.sklep.pl/img/photo.jpg", {"width": "100%"}) is False
+        assert app._is_junk_image("https://cdn.sklep.pl/img/photo.jpg", {"width": "auto"}) is False
+
+    def test_is_junk_image_passes_large_dimensioned_image(self):
+        assert app._is_junk_image(
+            "https://cdn.sklep.pl/img/photo.jpg", {"width": "800", "height": "600"}
+        ) is False
+
+    def test_other_urls_excludes_logos_icons_and_tiny_ui_images(self):
+        html = """
+        <html><head>
+        <meta property="og:image" content="https://cdn.sklep.pl/img/main-photo.jpg">
+        </head><body>
+        <img src="https://cdn.sklep.pl/img/gallery-2.jpg">
+        <img src="https://cdn.sklep.pl/img/store-logo.png">
+        <img src="https://cdn.sklep.pl/icons/inpost-courier.png">
+        <img src="https://cdn.sklep.pl/img/star-rating.png">
+        <img src="https://cdn.sklep.pl/img/tiny-swatch.png" width="32" height="32">
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert content["other_urls"] == ["https://cdn.sklep.pl/img/gallery-2.jpg"]
+
+    def test_main_image_is_never_junk_filtered(self):
+        # og:image is trusted as-is even if its URL happens to contain a
+        # junk keyword - only the "other images" pool is filtered.
+        html = """
+        <html><head>
+        <meta property="og:image" content="https://cdn.sklep.pl/img/banner-hero-product.jpg">
+        </head><body>
+        <img src="https://cdn.sklep.pl/img/second-photo.jpg">
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert content["main_url"] == "https://cdn.sklep.pl/img/banner-hero-product.jpg"
+
+
+class TestMaxImagesPerPageCap:
+    def test_total_images_never_exceed_max_images_per_page(self):
+        many_imgs = "".join(
+            f'<img src="https://cdn.sklep.pl/img/photo-{i}.jpg">\n' for i in range(25)
+        )
+        html = f"""
+        <html><head>
+        <meta property="og:image" content="https://cdn.sklep.pl/img/main.jpg">
+        </head><body>
+        {many_imgs}
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        total = (1 if content["main_url"] else 0) + len(content["other_urls"])
+        assert total <= app.MAX_IMAGES_PER_PAGE
+        assert len(content["other_urls"]) == app.MAX_IMAGES_PER_PAGE - 1
+
+    def test_max_images_per_page_is_ten(self):
+        assert app.MAX_IMAGES_PER_PAGE == 10
+
+
+class TestJsonldFullGalleryExtraction:
+    def test_all_jsonld_gallery_images_join_the_other_urls_pool(self):
+        html = """
+        <html><head>
+        <script type="application/ld+json">
+        {"@type": "Product", "name": "Cybex Priam",
+         "image": ["https://cdn.sklep.pl/img/jsonld-1.jpg",
+                    "https://cdn.sklep.pl/img/jsonld-2.jpg",
+                    "https://cdn.sklep.pl/img/jsonld-3.jpg"]}
+        </script>
+        </head><body></body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert content["main_url"] == "https://cdn.sklep.pl/img/jsonld-1.jpg"
+        assert "https://cdn.sklep.pl/img/jsonld-2.jpg" in content["other_urls"]
+        assert "https://cdn.sklep.pl/img/jsonld-3.jpg" in content["other_urls"]
+
+    def test_jsonld_gallery_images_are_still_junk_filtered(self):
+        html = """
+        <html><head>
+        <script type="application/ld+json">
+        {"@type": "Product", "name": "Cybex Priam",
+         "image": ["https://cdn.sklep.pl/img/jsonld-main.jpg",
+                    "https://cdn.sklep.pl/img/store-logo.jpg"]}
+        </script>
+        </head><body></body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert content["main_url"] == "https://cdn.sklep.pl/img/jsonld-main.jpg"
+        assert content["other_urls"] == []
 
 
 class TestBodyDescriptionExtraction:

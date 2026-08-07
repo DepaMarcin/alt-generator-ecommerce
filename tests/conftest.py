@@ -60,14 +60,17 @@ def html_with_jsonld_only():
 @pytest.fixture
 def html_with_gallery_img_only():
     """Priority 3: no og:image and no JSON-LD - an <img> inside a gallery
-    container should win over plain <img> tags elsewhere on the page."""
+    container should win over plain <img> tags elsewhere on the page. The
+    two non-gallery images use neutral filenames on purpose - this fixture
+    isn't meant to exercise the junk-image filter (see test_junk_filter
+    fixtures/tests for that)."""
     return """
     <html><head><title>Sklep XYZ</title></head><body>
-    <img src="https://cdn.sklep.pl/img/header-logo.jpg">
+    <img src="https://cdn.sklep.pl/img/top-of-page-photo.jpg">
     <div id="gallery">
       <img src="https://cdn.sklep.pl/img/gallery-main.jpg">
     </div>
-    <img src="https://cdn.sklep.pl/img/footer-banner.jpg">
+    <img src="https://cdn.sklep.pl/img/bottom-of-page-photo.jpg">
     </body></html>
     """
 

@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import uuid
 import ipaddress
 import socket
@@ -48,7 +49,8 @@ CONSECUTIVE_ERROR_LIMIT = 5          # Isolated transient errors shouldn't abort
 MAX_URLS_PER_BATCH = 1000            # Safety cap on how many page URLs one batch can queue (after sitemap expansion)
 MAX_SITEMAP_URLS_PER_FILE = 2000     # Cap per individual sitemap/sitemap-index fetch
 MAX_SITEMAP_DEPTH = 3                # How many levels of nested sitemap indexes to follow
-MAX_IMAGES_PER_PAGE = 30             # Safety cap on how many images one page can queue (incl. the main image)
+MAX_IMAGES_PER_PAGE = 10             # Safety cap on how many images one page can queue (incl. the main image)
+MAX_RAW_IMAGE_CANDIDATES = 150       # How many raw <img> tags to scan per page before junk-filtering/capping
 PAGE_FETCH_TIMEOUT_SECONDS = 20
 MAX_PAGE_FETCH_BYTES = 15 * 1024 * 1024   # a product page's HTML/sitemap XML shouldn't exceed this
 MAX_URL_REDIRECTS = 5
@@ -243,6 +245,47 @@ def _is_svg_url(url: str) -> bool:
     return urlparse(url).path.lower().endswith(".svg")
 
 
+# Keywords that show up in the URL of UI chrome/branding rather than an
+# actual product photo: logos, payment/delivery/social/courier icons, trust
+# badges, star ratings, avatars, buttons/arrows, placeholders.
+_JUNK_URL_KEYWORDS = (
+    "logo", "icon", "ikona", "banner", "badge", "payment", "platn", "delivery",
+    "dostaw", "inpost", "dpd", "courier", "visa", "mastercard", "blik", "social",
+    "facebook", "instagram", "footer", "header", "certyfikat", "trust", "star",
+    "rating", "avatar", "button", "arrow", "placeholder",
+)
+JUNK_IMAGE_MIN_DIMENSION_PX = 80
+
+
+def _parse_pixel_size(value):
+    """Parses a leading integer out of an HTML width/height attribute value
+    (e.g. "80", "80px") - returns None for anything else (percentages,
+    "auto", missing), since those aren't a reliable pixel size signal."""
+    if not value:
+        return None
+    match = re.match(r'\s*(\d+)', str(value))
+    return int(match.group(1)) if match else None
+
+
+def _is_junk_image(url: str, attrs_dict: dict = None) -> bool:
+    """True for images that are almost certainly UI chrome/branding rather
+    than a real product photo - identified by a keyword in the URL, or by an
+    explicit width/height attribute under JUNK_IMAGE_MIN_DIMENSION_PX (an
+    icon-sized <img>). Only used to filter the "other images" pool - the
+    main image cascade (og:image/JSON-LD/gallery <img>) is trusted as-is."""
+    lowered = (url or "").lower()
+    if any(keyword in lowered for keyword in _JUNK_URL_KEYWORDS):
+        return True
+
+    attrs_dict = attrs_dict or {}
+    for attr in ("width", "height"):
+        size = _parse_pixel_size(attrs_dict.get(attr))
+        if size is not None and size < JUNK_IMAGE_MIN_DIMENSION_PX:
+            return True
+
+    return False
+
+
 def _decode_unicode_js_escapes(text: str) -> str:
     """Undoes JS-style \\uXXXX escapes (and the \\/ escape) that leak into
     image URLs when a page embeds them as a raw JSON string (Magento/Hyva
@@ -319,19 +362,29 @@ def _find_jsonld_product_nodes(ld_json_blocks: list) -> list:
     return nodes
 
 
-def _extract_jsonld_product_image(ld_json_blocks: list):
-    """Priority 2 of the main-image cascade: the first Product node's
-    "image" field."""
+def _extract_jsonld_product_images(ld_json_blocks: list) -> list:
+    """Priority 2 of the main-image cascade: every image URL in the first
+    Product node's "image" field - a single string, a list of strings, or a
+    list/single ImageObject dict. JSON-LD often carries the site's *entire*
+    product gallery here, not just one photo, so the first entry feeds the
+    main-image cascade and the rest join the "other images" pool."""
     for item in _find_jsonld_product_nodes(ld_json_blocks):
         image = item.get("image")
-        if isinstance(image, list) and image:
-            image = image[0]
-        if isinstance(image, dict):
-            image = image.get("url") or image.get("@id")
-        if isinstance(image, str) and image.strip():
-            return image.strip()
+        if image is None:
+            continue
 
-    return None
+        candidates = image if isinstance(image, list) else [image]
+        urls = []
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                candidate = candidate.get("url") or candidate.get("@id")
+            if isinstance(candidate, str) and candidate.strip():
+                urls.append(candidate.strip())
+
+        if urls:
+            return urls
+
+    return []
 
 
 def _extract_jsonld_product_description(ld_json_blocks: list):
@@ -362,6 +415,7 @@ class _PageParser(HTMLParser):
         self.h1 = ""
         self.meta_image_candidates = []
         self.img_urls = []
+        self.img_attrs_by_url = {}  # raw <img> url -> its attrs dict (for the junk-image size check)
         self.priority_img_urls = []
         self.ld_json_blocks = []
         self.description_candidates = {}  # rank -> first captured text for that rank
@@ -419,6 +473,9 @@ class _PageParser(HTMLParser):
                     first = srcset.split(",")[0].strip().split(" ")[0]
                     if first and not first.startswith("data:"):
                         chosen = first
+
+            if chosen and chosen not in self.img_attrs_by_url:
+                self.img_attrs_by_url[chosen] = attrs_dict
 
             if chosen and chosen not in self._seen_img_urls:
                 self._seen_img_urls.add(chosen)
@@ -494,13 +551,22 @@ def extract_page_content(html_text: str, page_url: str) -> dict:
     usually marketing filler rather than real product knowledge.
 
     The main image is picked via a cascade, strongest signal first: (1)
-    og:image/twitter:image meta tags, (2) JSON-LD Product.image, (3) an <img>
-    hinted as high-priority/eager or sitting inside a gallery container -
-    falling back to the first <img> on the page if none of that is present.
-    Every candidate URL is sanitized/decoded/resolved to an absolute http(s)
-    URL before use. SVG icons are excluded - everything else (including
-    small graphics) is kept, since size alone isn't a reliable signal of
-    relevance here."""
+    og:image/twitter:image meta tags, (2) JSON-LD Product.image (often the
+    site's full product gallery - the rest of that array joins the "other"
+    pool below), (3) an <img> hinted as high-priority/eager or sitting
+    inside a gallery container - falling back to the first <img> on the page
+    if none of that is present. Every candidate URL is sanitized/decoded/
+    resolved to an absolute http(s) URL before use, and SVGs are always
+    excluded.
+
+    "Other" images (everything besides main_url) are additionally run
+    through _is_junk_image() - logos, payment/delivery/social/courier icons,
+    trust badges, ratings, avatars, buttons/arrows, placeholders, and any
+    <img> with an explicit width/height under JUNK_IMAGE_MIN_DIMENSION_PX
+    are dropped, since those are UI chrome, not product photos. The main
+    image itself is never junk-filtered - it's trusted as-is from the
+    cascade above. main_url + other_urls together never exceed
+    MAX_IMAGES_PER_PAGE."""
     parser = _PageParser()
     try:
         parser.feed(html_text)
@@ -541,26 +607,54 @@ def extract_page_content(html_text: str, page_url: str) -> dict:
     # Priority 1: OpenGraph / Twitter meta image.
     meta_candidates = add_candidates(parser.meta_image_candidates)
 
-    # Priority 2: JSON-LD structured data (schema.org Product.image).
-    jsonld_image = _extract_jsonld_product_image(parser.ld_json_blocks)
-    jsonld_candidates = add_candidates([jsonld_image] if jsonld_image else [])
+    # Priority 2: JSON-LD structured data - schema.org Product.image is often
+    # the site's *entire* product gallery, not just one photo. The first
+    # entry feeds the main-image cascade; the rest join the "other" pool.
+    jsonld_gallery_raw = _extract_jsonld_product_images(parser.ld_json_blocks)
+    jsonld_candidates = add_candidates(jsonld_gallery_raw[:1])
+    jsonld_gallery_extra = add_candidates(jsonld_gallery_raw[1:])
 
     # Priority 3: a dedicated/eager-loaded <img> or one inside a gallery container.
     priority_candidates = add_candidates(parser.priority_img_urls)
 
-    # Everything else on the page, queued as additional images.
-    body_images = []
-    for raw_url in parser.img_urls:
-        if len(seen) >= MAX_IMAGES_PER_PAGE:
-            break
-        body_images.extend(add_candidates([raw_url]))
+    # Everything else on the page (cap how many raw <img> tags we even
+    # bother sanitizing - well above MAX_IMAGES_PER_PAGE since most will be
+    # junk-filtered out below).
+    body_images = add_candidates(parser.img_urls[:MAX_RAW_IMAGE_CANDIDATES])
+
+    # clean (sanitized/absolute) image URL -> its original <img> attrs, so
+    # the junk filter can check width/height even after the URL itself has
+    # been rewritten (relative -> absolute, unicode-decoded, ...).
+    clean_url_attrs = {}
+    for raw_url in parser.img_urls[:MAX_RAW_IMAGE_CANDIDATES]:
+        clean = sanitize_image_url(raw_url, page_url)
+        if clean and clean not in clean_url_attrs:
+            clean_url_attrs[clean] = parser.img_attrs_by_url.get(raw_url) or {}
 
     ranked_main_candidates = meta_candidates + jsonld_candidates + priority_candidates
     main_url = ranked_main_candidates[0] if ranked_main_candidates else (body_images[0] if body_images else None)
 
-    remaining = [u for u in ranked_main_candidates if u != main_url] + [u for u in body_images if u != main_url]
-    main_fallbacks = remaining
-    other_urls = remaining[:MAX_IMAGES_PER_PAGE]
+    # Alternate main-photo candidates (retried if main_url 404s) - NOT
+    # junk-filtered, these are strong "this is the product photo" signals.
+    main_fallbacks = [u for u in ranked_main_candidates if u != main_url]
+
+    # "Other" images: every remaining candidate (spare main-cascade signals,
+    # the rest of the JSON-LD gallery, spare body images), deduped and
+    # junk-filtered (logos/icons/badges/payment/delivery/social/UI chrome),
+    # capped so main_url + other_urls never exceeds MAX_IMAGES_PER_PAGE.
+    other_pool = main_fallbacks + jsonld_gallery_extra + [u for u in body_images if u != main_url]
+    other_budget = MAX_IMAGES_PER_PAGE - (1 if main_url else 0)
+    other_urls = []
+    other_seen = set()
+    for u in other_pool:
+        if u == main_url or u in other_seen:
+            continue
+        if _is_junk_image(u, clean_url_attrs.get(u)):
+            continue
+        other_seen.add(u)
+        other_urls.append(u)
+        if len(other_urls) >= other_budget:
+            break
 
     return {
         "context": context,
@@ -947,6 +1041,10 @@ def process_single_image(image_url: str, context: str, job_dir: str, fallback_ur
                           task_id: str = None) -> dict:
     cached = _get_cached_image_result(task_id, image_url)
     if cached is not None:
+        # A cache hit does zero real work - report that honestly instead of
+        # replaying whatever timings were measured when this URL was first
+        # processed (possibly on a completely different page).
+        cached["_perf"] = {"download": 0.0, "compress": 0.0, "openai": 0.0}
         return cached
 
     # og:image/twitter:image variants can point at the same photo under
@@ -956,6 +1054,7 @@ def process_single_image(image_url: str, context: str, job_dir: str, fallback_ur
     local_path = None
     used_url = image_url
     last_error = None
+    download_start = time.perf_counter()
     for candidate_url in candidate_urls:
         try:
             local_path = download_image_from_url(candidate_url, job_dir)
@@ -963,11 +1062,17 @@ def process_single_image(image_url: str, context: str, job_dir: str, fallback_ur
             break
         except Exception as e:
             last_error = e
+    download_elapsed = time.perf_counter() - download_start
     if local_path is None:
         raise last_error if last_error is not None else RuntimeError("Nie udało się pobrać obrazu.")
 
+    compress_start = time.perf_counter()
     compressed_path = compress_image(local_path)
+    compress_elapsed = time.perf_counter() - compress_start
+
+    openai_start = time.perf_counter()
     alt_text = generate_alt_via_openai(compressed_path, context)
+    openai_elapsed = time.perf_counter() - openai_start
 
     media_type = mimetypes.guess_type(compressed_path)[0] or "image/jpeg"
     with open(compressed_path, "rb") as f:
@@ -980,6 +1085,9 @@ def process_single_image(image_url: str, context: str, job_dir: str, fallback_ur
         "skipped": False,
         "skip_reason": None,
         "image_data": f"data:{media_type};base64,{encoded_image}",
+        # Internal profiling data - process_page_url reads and strips this
+        # before the result ever reaches JOBS["results"] / the frontend.
+        "_perf": {"download": download_elapsed, "compress": compress_elapsed, "openai": openai_elapsed},
     }
     # Only successful results are cached - a transient download/API failure
     # shouldn't poison every later page that happens to share the URL.
@@ -1004,14 +1112,36 @@ def _process_image_safe(image_url: str, context: str, job_dir: str, fallback_url
         }
 
 
+def _log_page_perf(page_url: str, page_fetch_s: float, download_s: float,
+                    compress_s: float, openai_s: float) -> None:
+    total_s = page_fetch_s + download_s + compress_s + openai_s
+    # This runs inside background worker threads, so it never reaches the
+    # request/response cycle Flask's dev server auto-flushes for you - print
+    # straight to sys.stdout (same stream as Flask's HTTP request logs) with
+    # flush=True, otherwise Windows line-buffers stdout when it's not an
+    # interactive console and the [PERF] lines only show up in bursts (or
+    # not at all before the process exits).
+    print(
+        f"[PERF] {page_url} | Str: {page_fetch_s:.1f}s | Pobranie obr: {download_s:.1f}s | "
+        f"Kompresja: {compress_s:.1f}s | OpenAI: {openai_s:.1f}s | SUMA: {total_s:.1f}s",
+        file=sys.stdout, flush=True,
+    )
+
+
 def process_page_url(page_url: str, job_dir: str, task_id: str = None) -> dict:
     """One full unit of work: fetch a product page, pull every image on it
     (main + the rest) from its markup, and generate an ALT for each one.
     The main image is processed first, then the remaining images are
     processed concurrently (up to PAGE_IMAGE_WORKERS at a time) - each
     candidate is checked against the job's shared image_cache first, so an
-    asset that repeats across pages is only ever downloaded/analyzed once."""
+    asset that repeats across pages is only ever downloaded/analyzed once.
+
+    Prints a [PERF] summary line per page (page fetch + the images' summed
+    download/compression/OpenAI time) to make slow pages/steps visible."""
+    page_fetch_start = time.perf_counter()
     html_text, final_url = fetch_page_html(page_url)
+    page_fetch_elapsed = time.perf_counter() - page_fetch_start
+
     content = extract_page_content(html_text, final_url)
 
     result = {
@@ -1030,6 +1160,7 @@ def process_page_url(page_url: str, job_dir: str, task_id: str = None) -> dict:
             "skip_reason": "Nie znaleziono żadnej grafiki na stronie.",
             "image_data": "",
         }
+        _log_page_perf(page_url, page_fetch_elapsed, 0.0, 0.0, 0.0)
         return result
 
     result["main_image"] = _process_image_safe(
@@ -1046,6 +1177,19 @@ def process_page_url(page_url: str, job_dir: str, task_id: str = None) -> dict:
                 lambda u: _process_image_safe(u, content["context"], job_dir, task_id=task_id),
                 other_urls,
             ))
+
+    # Sum each image's measured download/compression/OpenAI time for the
+    # page-level summary, then strip the internal _perf field - it's never
+    # meant to reach JOBS["results"] / the frontend.
+    download_total = compress_total = openai_total = 0.0
+    for image_result in [result["main_image"]] + result["other_images"]:
+        perf = image_result.pop("_perf", None)
+        if perf:
+            download_total += perf.get("download", 0.0)
+            compress_total += perf.get("compress", 0.0)
+            openai_total += perf.get("openai", 0.0)
+
+    _log_page_perf(page_url, page_fetch_elapsed, download_total, compress_total, openai_total)
 
     return result
 
