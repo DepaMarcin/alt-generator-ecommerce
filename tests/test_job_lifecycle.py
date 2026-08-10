@@ -143,3 +143,65 @@ class TestImageCacheDeduplication:
         assert mock_download.call_count == 2
         assert result["skipped"] is False
         assert result["alt"] == "Logo sklepu."
+
+
+class TestPerfMetricsOnError:
+    """process_single_image attaches _perf to the exception it raises, and
+    _process_image_safe carries it into the error result dict - so a failed
+    image still contributes real timing to the page's [PERF] summary
+    instead of silently reading 0.0s for work that clearly wasn't free."""
+
+    def test_download_failure_reports_real_download_time(self, registered_job, mocker):
+        task_id = registered_job("processing")
+
+        def _slow_failure(_url, _dest_dir):
+            time.sleep(0.05)
+            raise ValueError("404 not found")
+
+        mocker.patch.object(app, "download_image_from_url", side_effect=_slow_failure)
+
+        result = app._process_image_safe(
+            "https://cdn.sklep.pl/img/broken.jpg", "Produkt: A", "/tmp/job", task_id=task_id
+        )
+
+        assert "Błąd przetwarzania" in result["alt"]
+        assert "_perf" in result
+        assert result["_perf"]["download"] >= 0.05
+        assert result["_perf"]["compress"] == 0.0
+        assert result["_perf"]["openai"] == 0.0
+
+    def test_openai_failure_reports_real_download_and_compress_time(
+        self, registered_job, mocker, dummy_image_path
+    ):
+        task_id = registered_job("processing")
+        mocker.patch.object(app, "download_image_from_url", return_value=dummy_image_path)
+        mocker.patch.object(app, "compress_image", return_value=dummy_image_path)
+
+        def _slow_openai_failure(*_args, **_kwargs):
+            time.sleep(0.05)
+            raise RuntimeError("Błąd API OpenAI: quota exhausted")
+
+        mocker.patch.object(app, "generate_alt_via_openai", side_effect=_slow_openai_failure)
+
+        result = app._process_image_safe(
+            "https://cdn.sklep.pl/img/photo.jpg", "Produkt: A", "/tmp/job", task_id=task_id
+        )
+
+        assert "Błąd przetwarzania" in result["alt"]
+        assert "_perf" in result
+        assert result["_perf"]["openai"] >= 0.05
+
+    def test_page_perf_aggregation_counts_failed_images(self, registered_job, mocker):
+        """Sanity check that process_page_url's summation (image_result.pop
+        "_perf") actually finds this data - mirrors the loop in
+        process_page_url without needing a full page fetch."""
+        task_id = registered_job("processing")
+        mocker.patch.object(app, "download_image_from_url", side_effect=ValueError("404"))
+
+        error_result = app._process_image_safe(
+            "https://cdn.sklep.pl/img/broken.jpg", "Produkt: A", "/tmp/job", task_id=task_id
+        )
+
+        download_total = error_result.pop("_perf")["download"]
+        assert download_total > 0.0
+        assert "_perf" not in error_result

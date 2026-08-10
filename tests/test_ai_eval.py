@@ -7,7 +7,11 @@ generate_alt_via_openai() post-processing (quote/newline cleanup) and (b) the
 quality-gate helper functions below, exercised against both compliant and
 deliberately bad canned model outputs.
 """
+from types import SimpleNamespace
+
+import httpx
 import pytest
+from openai import RateLimitError
 
 import app
 
@@ -147,3 +151,46 @@ def test_keyword_stuffing_detection_passes_varied_batch(openai_stub, dummy_image
     alts = [app.generate_alt_via_openai(dummy_image_path, PRODUCT_CONTEXT) for _ in range(10)]
 
     assert has_keyword_stuffing(alts) is False
+
+
+# ---------------------------------------------------------------------------
+# Quota-exhaustion handling: insufficient_quota/project_spend_limit_exceeded
+# must abort immediately (no retries, no backoff sleep) - a transient 429
+# still has to retry as before.
+# ---------------------------------------------------------------------------
+
+def _make_rate_limit_error(code: str, message: str = "Rate limited") -> RateLimitError:
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    response = httpx.Response(429, request=request, json={"error": {"message": message, "type": code, "code": code}})
+    body = {"message": message, "type": code, "param": None, "code": code}
+    return RateLimitError(message, response=response, body=body)
+
+
+@pytest.mark.parametrize("quota_code", ["insufficient_quota", "project_spend_limit_exceeded"])
+def test_quota_exhaustion_aborts_immediately_without_retrying(mocker, dummy_image_path, quota_code):
+    error = _make_rate_limit_error(quota_code)
+    mock_create = mocker.patch.object(app.openai_client.chat.completions, "create", side_effect=error)
+    mock_sleep = mocker.patch("app.time.sleep")
+
+    with pytest.raises(RuntimeError):
+        app.generate_alt_via_openai(dummy_image_path, PRODUCT_CONTEXT)
+
+    assert mock_create.call_count == 1
+    mock_sleep.assert_not_called()
+
+
+def test_transient_rate_limit_still_retries_and_eventually_succeeds(mocker, dummy_image_path):
+    transient_error = _make_rate_limit_error("rate_limit_exceeded", "Too many requests, slow down.")
+    success_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="Czarny wózek dziecięcy Cybex Priam."))]
+    )
+    mock_create = mocker.patch.object(
+        app.openai_client.chat.completions, "create",
+        side_effect=[transient_error, success_response],
+    )
+    mocker.patch("app.time.sleep")
+
+    alt = app.generate_alt_via_openai(dummy_image_path, PRODUCT_CONTEXT)
+
+    assert alt == "Czarny wózek dziecięcy Cybex Priam."
+    assert mock_create.call_count == 2

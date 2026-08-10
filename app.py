@@ -953,6 +953,23 @@ def _extract_retry_after_seconds(rate_limit_error):
     return None
 
 
+# RateLimitError codes that mean "no budget left on the account/project" -
+# unlike a transient burst-of-requests 429, waiting and retrying can never
+# fix these, so it's pointless (and slow) to burn through max_retries
+# attempts and their backoff waits.
+_NON_RETRYABLE_RATE_LIMIT_MARKERS = ("insufficient_quota", "project_spend_limit_exceeded")
+
+
+def _is_quota_exhausted_error(rate_limit_error: RateLimitError) -> bool:
+    parts = [str(rate_limit_error)]
+    for attr in ("code", "body"):
+        value = getattr(rate_limit_error, attr, None)
+        if value:
+            parts.append(str(value))
+    haystack = " ".join(parts).lower()
+    return any(marker in haystack for marker in _NON_RETRYABLE_RATE_LIMIT_MARKERS)
+
+
 def generate_alt_via_openai(image_path: str, context: str) -> str:
     media_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
     with open(image_path, "rb") as f:
@@ -990,6 +1007,11 @@ def generate_alt_via_openai(image_path: str, context: str) -> str:
             break
         except RateLimitError as e:
             last_error = e
+            if _is_quota_exhausted_error(e):
+                # No budget left on the account/project - retrying/waiting
+                # can't fix that, so stop immediately instead of sitting
+                # through up to 8 useless attempts.
+                break
             if attempt < max_retries - 1:
                 backoff = min(30.0, 2.0 * (2 ** attempt)) + random.uniform(0, 1)
                 wait = max(_extract_retry_after_seconds(e) or 0.0, backoff)
@@ -1064,14 +1086,27 @@ def process_single_image(image_url: str, context: str, job_dir: str, fallback_ur
             last_error = e
     download_elapsed = time.perf_counter() - download_start
     if local_path is None:
-        raise last_error if last_error is not None else RuntimeError("Nie udało się pobrać obrazu.")
+        error = last_error if last_error is not None else RuntimeError("Nie udało się pobrać obrazu.")
+        # Remember the (failed) download time before raising, so
+        # _process_image_safe can still report an honest [PERF] duration
+        # instead of defaulting to 0.0s for a request that clearly wasn't free.
+        error._perf = {"download": download_elapsed, "compress": 0.0, "openai": 0.0}
+        raise error
 
     compress_start = time.perf_counter()
     compressed_path = compress_image(local_path)
     compress_elapsed = time.perf_counter() - compress_start
 
     openai_start = time.perf_counter()
-    alt_text = generate_alt_via_openai(compressed_path, context)
+    try:
+        alt_text = generate_alt_via_openai(compressed_path, context)
+    except Exception as e:
+        e._perf = {
+            "download": download_elapsed,
+            "compress": compress_elapsed,
+            "openai": time.perf_counter() - openai_start,
+        }
+        raise
     openai_elapsed = time.perf_counter() - openai_start
 
     media_type = mimetypes.guess_type(compressed_path)[0] or "image/jpeg"
@@ -1109,6 +1144,10 @@ def _process_image_safe(image_url: str, context: str, job_dir: str, fallback_url
             "skipped": False,
             "skip_reason": None,
             "image_data": "",
+            # process_single_image attaches _perf to the exception before
+            # raising, so a failed image still contributes real timing to
+            # the page's [PERF] summary instead of silently reading 0.0s.
+            "_perf": getattr(e, "_perf", None) or {"download": 0.0, "compress": 0.0, "openai": 0.0},
         }
 
 
