@@ -85,6 +85,7 @@
       <div class="w-full h-3 bg-neutral-200 rounded-full overflow-hidden">
         <div id="progress-bar" class="h-full bg-[#00E676] transition-all duration-300" style="width: 0%"></div>
       </div>
+      <p id="progress-error-banner" class="hidden mt-3 text-sm font-semibold text-red-700 bg-red-50 border border-red-200 rounded-md px-4 py-3"></p>
       <p id="progress-text" class="mt-3 text-sm font-semibold text-neutral-700"></p>
     </section>
 
@@ -133,6 +134,7 @@
   const progressSection = document.getElementById('progress-section');
   const progressStatus = document.getElementById('progress-status');
   const progressBar = document.getElementById('progress-bar');
+  const progressErrorBanner = document.getElementById('progress-error-banner');
   const progressText = document.getElementById('progress-text');
 
   const resultsSection = document.getElementById('results-section');
@@ -205,7 +207,11 @@
     resultsBody.innerHTML = '';
     resultsSection.classList.add('hidden');
     progressBar.style.width = '0%';
+    progressBar.classList.remove('bg-red-600');
+    progressBar.classList.add('bg-[#00E676]');
     progressText.textContent = '';
+    progressErrorBanner.classList.add('hidden');
+    progressErrorBanner.textContent = '';
   }
 
   form.addEventListener('submit', async (e) => {
@@ -274,11 +280,10 @@
       if (['completed', 'error', 'stopped_error'].includes(job.status)) {
         stopPolling();
         submitBtn.disabled = false;
-        if (job.status === 'error') {
-          showError(job.error_message || 'Wystąpił błąd podczas przetwarzania.');
-        } else if (job.status === 'stopped_error') {
-          showError(job.error_message || 'Przetwarzanie zatrzymane z powodu błędów.');
-        } else if (job.error_message) {
+        // 'error' / 'stopped_error' already get a dedicated red banner
+        // right under the progress bar (see renderJob) - no need to
+        // duplicate the same message up in the form's error banner too.
+        if (job.status === 'completed' && job.error_message) {
           showError(job.error_message);
         }
       }
@@ -302,6 +307,10 @@
     const pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
     progressBar.style.width = pct + '%';
 
+    const isErrorState = job.status === 'error' || job.status === 'stopped_error';
+    progressBar.classList.toggle('bg-[#00E676]', !isErrorState);
+    progressBar.classList.toggle('bg-red-600', isErrorState);
+
     if (job.status === 'parsing') {
       progressStatus.textContent = 'Przygotowywanie listy adresów...';
       progressText.textContent = 'Wczytywanie adresów (rozwijanie sitemap, jeśli podano)...';
@@ -311,10 +320,16 @@
     } else if (job.status === 'completed') {
       progressStatus.textContent = 'Zakończono';
       progressText.textContent = `Gotowe - przetworzono ${processed} z ${total} podstron.`;
-    } else if (job.status === 'stopped_error') {
-      progressStatus.textContent = 'Zatrzymano';
-    } else if (job.status === 'error') {
-      progressStatus.textContent = 'Błąd';
+    } else if (isErrorState) {
+      progressStatus.textContent = 'ZATRZYMANO Z BŁĘDEM';
+    }
+
+    if (isErrorState && job.error_message) {
+      progressErrorBanner.textContent = job.error_message;
+      progressErrorBanner.classList.remove('hidden');
+    } else {
+      progressErrorBanner.classList.add('hidden');
+      progressErrorBanner.textContent = '';
     }
 
     currentResults = job.results || [];
@@ -348,8 +363,19 @@
     }
   }
 
+  // Raw quota-exhaustion error codes should never clutter the results
+  // table as a per-image "card" - the job-level red banner already tells
+  // the user what happened and what to do about it.
+  const QUOTA_ERROR_MARKERS = ['insufficient_quota', 'project_spend_limit_exceeded'];
+
+  function isQuotaErrorAlt(img) {
+    if (!img || img.skipped || !img.alt) return false;
+    const lowered = img.alt.toLowerCase();
+    return QUOTA_ERROR_MARKERS.some(marker => lowered.includes(marker));
+  }
+
   function imageAltRowHtml(img, isMain) {
-    if (!img) return '';
+    if (!img || isQuotaErrorAlt(img)) return '';
     const filename = escapeHtml(fileNameFromUrl(img.image_url));
     const badge = isMain
       ? '<span class="inline-block bg-[#00E676] text-black text-[10px] font-black uppercase tracking-wide px-2 py-0.5 rounded mr-2 whitespace-nowrap">🟢 Grafika główna</span>'

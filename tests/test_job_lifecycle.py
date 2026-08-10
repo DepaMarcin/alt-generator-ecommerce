@@ -205,3 +205,43 @@ class TestPerfMetricsOnError:
         download_total = error_result.pop("_perf")["download"]
         assert download_total > 0.0
         assert "_perf" not in error_result
+
+
+class TestQuotaExhaustedHandling:
+    """Regression coverage for the OpenAI quota-exhaustion cleanup: a
+    QuotaExhaustedError must never be recorded as a per-image or per-page
+    error - it has to stop the whole batch instead."""
+
+    def test_process_image_safe_lets_quota_exhausted_error_propagate(
+        self, registered_job, mocker, dummy_image_path
+    ):
+        task_id = registered_job("processing")
+        mocker.patch.object(app, "download_image_from_url", return_value=dummy_image_path)
+        mocker.patch.object(app, "compress_image", return_value=dummy_image_path)
+        mocker.patch.object(
+            app, "generate_alt_via_openai",
+            side_effect=app.QuotaExhaustedError("Wyczerpano limit środków lub zapytań API."),
+        )
+
+        with pytest.raises(app.QuotaExhaustedError):
+            app._process_image_safe(
+                "https://cdn.sklep.pl/img/photo.jpg", "Produkt: A", "/tmp/job", task_id=task_id
+            )
+
+    def test_background_worker_stops_batch_on_quota_exhaustion(self, registered_job, mocker, tmp_path):
+        task_id = registered_job("parsing")
+        mocker.patch.object(
+            app, "process_page_url",
+            side_effect=app.QuotaExhaustedError("Wyczerpano limit środków lub zapytań API."),
+        )
+
+        app.background_worker(task_id, ["https://sklep.pl/p1", "https://sklep.pl/p2"], str(tmp_path))
+
+        with app.JOBS_LOCK:
+            job = dict(app.JOBS[task_id])
+
+        assert job["status"] == "stopped_error"
+        assert "Wyczerpano limit" in job["error_message"]
+        # No per-page error entries should have been recorded for the pages
+        # that hit the quota wall - just the job-level stop.
+        assert job["results"] == []

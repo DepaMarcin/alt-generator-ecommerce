@@ -970,6 +970,15 @@ def _is_quota_exhausted_error(rate_limit_error: RateLimitError) -> bool:
     return any(marker in haystack for marker in _NON_RETRYABLE_RATE_LIMIT_MARKERS)
 
 
+class QuotaExhaustedError(Exception):
+    """Raised instead of a generic RuntimeError when OpenAI reports the
+    account/project is out of budget (insufficient_quota /
+    project_spend_limit_exceeded). Deliberately NOT caught per-image -
+    _process_image_safe lets it propagate so the whole batch stops instead
+    of recording it as just another failed image."""
+    pass
+
+
 def generate_alt_via_openai(image_path: str, context: str) -> str:
     media_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
     with open(image_path, "rb") as f:
@@ -1006,12 +1015,15 @@ def generate_alt_via_openai(image_path: str, context: str) -> str:
             last_error = None
             break
         except RateLimitError as e:
-            last_error = e
             if _is_quota_exhausted_error(e):
                 # No budget left on the account/project - retrying/waiting
-                # can't fix that, so stop immediately instead of sitting
-                # through up to 8 useless attempts.
-                break
+                # can't fix that, so abort immediately with a dedicated,
+                # user-facing exception instead of sitting through up to 8
+                # useless attempts and surfacing a generic API error.
+                raise QuotaExhaustedError(
+                    "Wyczerpano limit środków lub zapytań API. Doładuj saldo u dostawcy usługi, aby kontynuować."
+                ) from e
+            last_error = e
             if attempt < max_retries - 1:
                 backoff = min(30.0, 2.0 * (2 ** attempt)) + random.uniform(0, 1)
                 wait = max(_extract_retry_after_seconds(e) or 0.0, backoff)
@@ -1133,9 +1145,16 @@ def process_single_image(image_url: str, context: str, job_dir: str, fallback_ur
 def _process_image_safe(image_url: str, context: str, job_dir: str, fallback_urls: list = None,
                          task_id: str = None) -> dict:
     """process_single_image, but never raises - a failure on one image (main
-    or one of the "others") shouldn't take down the rest of the page."""
+    or one of the "others") shouldn't take down the rest of the page.
+
+    QuotaExhaustedError is the one exception deliberately let through
+    uncaught: it doesn't mean "this image failed", it means "the whole batch
+    needs to stop right now" - worker_task handles it at the page level, so
+    it must never be recorded here as a per-image error entry."""
     try:
         return process_single_image(image_url, context, job_dir, fallback_urls=fallback_urls, task_id=task_id)
+    except QuotaExhaustedError:
+        raise
     except Exception as e:
         return {
             "image_url": image_url,
@@ -1292,10 +1311,20 @@ def background_worker(task_id: str, seed_urls: list, job_dir: str):
             if stop_event.is_set():
                 return
 
-            is_error = False
-            error_detail = None
             try:
                 res = process_page_url(page_url, job_dir, task_id=task_id)
+            except QuotaExhaustedError:
+                # Out of API budget - stop the whole batch right now rather
+                # than recording this as just another failed page.
+                stop_event.set()
+                with JOBS_LOCK:
+                    if task_id in JOBS:
+                        JOBS[task_id]["status"] = "stopped_error"
+                        JOBS[task_id]["error_message"] = (
+                            "Przetwarzanie przerwane: Wyczerpano limit środków lub zapytań API. "
+                            "Doładuj saldo u dostawcy usługi, aby kontynuować."
+                        )
+                return
             except Exception as e:
                 is_error = True
                 error_detail = str(e)
@@ -1308,6 +1337,9 @@ def background_worker(task_id: str, seed_urls: list, job_dir: str):
                     },
                     "other_images": [],
                 }
+            else:
+                is_error = False
+                error_detail = None
 
             with JOBS_LOCK:
                 if task_id not in JOBS or stop_event.is_set():

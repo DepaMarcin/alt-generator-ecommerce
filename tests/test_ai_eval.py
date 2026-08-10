@@ -172,7 +172,7 @@ def test_quota_exhaustion_aborts_immediately_without_retrying(mocker, dummy_imag
     mock_create = mocker.patch.object(app.openai_client.chat.completions, "create", side_effect=error)
     mock_sleep = mocker.patch("app.time.sleep")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(app.QuotaExhaustedError, match="Wyczerpano limit"):
         app.generate_alt_via_openai(dummy_image_path, PRODUCT_CONTEXT)
 
     assert mock_create.call_count == 1
