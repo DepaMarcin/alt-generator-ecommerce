@@ -158,7 +158,7 @@ _VOID_TAGS = {
 # description ("Dobra cena", "Szybka wysyłka"...). Deliberately precise (no
 # generic <article>/<main> fallback) - a broad fallback is exactly how
 # cross-sell/recommendation widget text used to leak into the context.
-DESCRIPTION_MAX_CHARS = 300
+DESCRIPTION_MAX_CHARS = 1000
 _DESCRIPTION_ID_RANKS = (
     ("description", 1),
     ("product-description", 2),
@@ -239,6 +239,32 @@ def _finalize_description_text(buffer: list) -> str:
             continue
         kept_fragments.append(collapsed)
     return ' '.join(kept_fragments)
+
+
+_SENTENCE_END_CHARS = (".", "!", "?")
+_TRUNCATE_MIN_SENTENCE_LENGTH = 100  # don't cut off after a suspiciously short "sentence"
+
+
+def _truncate_to_sentence(text: str, max_chars: int = DESCRIPTION_MAX_CHARS) -> str:
+    """Trims text to at most max_chars without cutting a word - or ideally a
+    sentence - in half. Prefers to end at the last full sentence within the
+    limit (so the description reads as a complete thought); if no
+    sentence-ending punctuation shows up early enough to be useful, falls
+    back to the last whole word instead of chopping one in the middle."""
+    if len(text) <= max_chars:
+        return text
+
+    truncated = text[:max_chars]
+
+    last_sentence_end = max(truncated.rfind(ch) for ch in _SENTENCE_END_CHARS)
+    if last_sentence_end >= _TRUNCATE_MIN_SENTENCE_LENGTH:
+        return truncated[:last_sentence_end + 1]
+
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        return truncated[:last_space]
+
+    return truncated
 
 
 def _is_svg_url(url: str) -> bool:
@@ -578,13 +604,13 @@ def extract_page_content(html_text: str, page_url: str) -> dict:
     # Priority 1: schema.org Product.description from JSON-LD.
     jsonld_description = _extract_jsonld_product_description(parser.ld_json_blocks)
     if jsonld_description:
-        description = re.sub(r'\s+', ' ', jsonld_description)[:DESCRIPTION_MAX_CHARS].strip()
+        description = _truncate_to_sentence(re.sub(r'\s+', ' ', jsonld_description).strip())
     else:
         # Priority 2: a dedicated description container in the body.
         description = ""
         if parser.description_candidates:
             best_rank = min(parser.description_candidates)
-            description = parser.description_candidates[best_rank][:DESCRIPTION_MAX_CHARS].strip()
+            description = _truncate_to_sentence(parser.description_candidates[best_rank].strip())
 
     context_parts = []
     if title:

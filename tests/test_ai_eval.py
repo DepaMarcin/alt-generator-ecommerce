@@ -9,7 +9,11 @@ deliberately bad canned model outputs.
 """
 from types import SimpleNamespace
 
-import httpx
+try:
+    import httpx
+except ImportError:  # newer openai releases (3.x+) vendor httpx as httpx2
+    import httpx2 as httpx
+
 import pytest
 from openai import RateLimitError
 

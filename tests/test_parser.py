@@ -202,6 +202,80 @@ class TestBodyDescriptionExtraction:
         assert len(desc_part) <= app.DESCRIPTION_MAX_CHARS
 
 
+class TestTruncateToSentence:
+    def test_short_text_is_returned_unchanged(self):
+        text = "Krotki opis produktu."
+        assert app._truncate_to_sentence(text, max_chars=100) == text
+
+    def test_text_at_exactly_max_chars_is_unchanged(self):
+        text = "x" * 50
+        assert app._truncate_to_sentence(text, max_chars=50) == text
+
+    def test_cuts_at_last_full_sentence_within_limit(self):
+        sentence_1 = "Poczatek opisu produktu ktory jest dosyc dlugi i szczegolowy, opisujacy wszystkie cechy."
+        sentence_2 = "Drugie zdanie z dodatkowymi informacjami o produkcie i jego zastosowaniu."
+        sentence_3 = "Trzecie zdanie zostanie ucie"
+        text = f"{sentence_1} {sentence_2} {sentence_3}"
+
+        result = app._truncate_to_sentence(text, max_chars=170)
+
+        assert result == f"{sentence_1} {sentence_2}"
+        assert result.endswith(".")
+
+    def test_falls_back_to_last_word_when_no_sentence_end_found(self):
+        text = "Slowo " * 30  # no punctuation anywhere
+        result = app._truncate_to_sentence(text, max_chars=50)
+        assert len(result) <= 50
+        assert not result.endswith(" ")
+        # must not cut a word in half - the fragment right at the cut
+        # should be a whole "Slowo", not e.g. "Slo"
+        assert text.startswith(result)
+        assert result == "" or text[len(result):len(result) + 1] in (" ", "")
+
+    def test_ignores_a_sentence_end_that_is_too_early(self):
+        # A period at position 3 is too close to the start to be a useful
+        # cut point - falls back to the last whole word instead.
+        text = "Sp. z o.o. oferuje szeroki wybor produktow dla domu i ogrodu w atrakcyjnych cenach"
+        result = app._truncate_to_sentence(text, max_chars=40)
+        assert len(result) <= 40
+        assert not result.endswith(" ")
+
+    def test_default_max_chars_matches_description_max_chars(self):
+        assert app.DESCRIPTION_MAX_CHARS == 1000
+        long_text = "Zdanie numer jeden. " * 100  # ~2000 chars
+        result = app._truncate_to_sentence(long_text)
+        assert len(result) <= 1000
+        assert result.endswith(".")
+
+    def test_extract_page_content_description_ends_on_a_full_sentence(self):
+        sentences = " ".join(f"To jest zdanie numer {i} opisu produktu." for i in range(60))
+        html = f"""
+        <html><head><title>Fallback</title></head><body>
+        <h1>Produkt z dlugim opisem</h1>
+        <div id="product-description">{sentences}</div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        desc_part = content["context"].split("Opis: ")[1]
+        assert len(desc_part) <= app.DESCRIPTION_MAX_CHARS
+        assert desc_part.endswith(".")
+        assert not desc_part.endswith(" ")
+
+    def test_jsonld_description_is_also_sentence_truncated(self):
+        sentences = " ".join(f"Zdanie numer {i} opisujace produkt szczegolowo." for i in range(60))
+        html = f"""
+        <html><head>
+        <script type="application/ld+json">
+        {{"@type": "Product", "name": "Produkt", "description": "{sentences}"}}
+        </script>
+        </head><body></body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        desc_part = content["context"].split("Opis: ")[1]
+        assert len(desc_part) <= app.DESCRIPTION_MAX_CHARS
+        assert desc_part.endswith(".")
+
+
 class TestDescriptionContextLeakPrevention:
     """Regression coverage for the "wrong product's description leaks into
     the context" bug: a recommended-products/cross-sell/carousel widget
