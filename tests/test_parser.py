@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from curl_cffi import requests as curl_requests
 
@@ -223,11 +225,12 @@ class TestBodyDescriptionExtraction:
         assert "Dokladny opis w itemprop" in content["context"]
         assert "Ogolny opis w kontenerze" not in content["context"]
 
-    def test_no_description_container_omits_description_segment(self):
+    def test_no_extractable_text_anywhere_omits_description_segment(self):
+        # A genuinely empty body - not even the longest-paragraph fallback
+        # (see TestFallbackHtmlDescription) has anything to find.
         html = """
         <html><head><title>Fallback</title></head><body>
         <h1>Produkt bez opisu</h1>
-        <p>Losowy tekst poza jakimkolwiek kontenerem opisu.</p>
         </body></html>
         """
         content = app.extract_page_content(html, "https://sklep.pl/produkt")
@@ -306,12 +309,12 @@ class TestStyleScriptContentExcludedFromDescription:
         html = """
         <html><head>
         <script type="application/ld+json">
-        {"@type": "Product", "name": "Produkt", "description": "Opis produktu z danych strukturalnych."}
+        {"@type": "Product", "name": "Produkt", "description": "Pelny opis produktu pochodzacy wprost z danych strukturalnych strony, zawierajacy pelen zestaw informacji o zastosowaniu."}
         </script>
         </head><body></body></html>
         """
         content = app.extract_page_content(html, "https://sklep.pl/produkt")
-        assert "Opis produktu z danych strukturalnych" in content["context"]
+        assert "Pelny opis produktu pochodzacy wprost z danych strukturalnych" in content["context"]
 
     def test_css_artifact_regex_strips_rule_blocks_and_bare_selectors(self):
         text = 'Prawdziwy tekst. .Icon_icon-v_XzHkY:before { content: "\\D"; } #footer { display:none; } Reszta opisu.'
@@ -321,6 +324,428 @@ class TestStyleScriptContentExcludedFromDescription:
         assert "{" not in cleaned and "}" not in cleaned
         assert "Icon_icon-v_XzHkY" not in cleaned
         assert "#footer" not in cleaned
+
+
+class TestCleanHtmlText:
+    """Regression coverage for the zakupy.auchan.pl bug: the JSON-LD (or
+    body) "description" field itself contained ready-made HTML markup
+    (<div style="...">Marka</div> <br> <p style="...">Informacje...</p>)
+    instead of plain text."""
+
+    def test_strips_html_tags(self):
+        text = '<div style="color:red">Marka</div> <br> <p style="font-size:12px">Informacje o produkcie</p>'
+        cleaned = app.clean_html_text(text)
+        assert "<" not in cleaned and ">" not in cleaned
+        assert "Marka" in cleaned
+        assert "Informacje o produkcie" in cleaned
+
+    def test_decodes_html_entities(self):
+        text = "Krem 50&nbsp;ml &amp; balsam &quot;Premium&quot;"
+        cleaned = app.clean_html_text(text)
+        assert "&nbsp;" not in cleaned
+        assert "&amp;" not in cleaned
+        assert "&quot;" not in cleaned
+        assert "50" in cleaned and "ml" in cleaned
+        assert "&" in cleaned  # the decoded literal ampersand itself is fine
+        assert '"Premium"' in cleaned
+
+    def test_collapses_whitespace_and_newlines(self):
+        text = "Linia pierwsza\n\n   Linia   druga\t\tLinia trzecia"
+        cleaned = app.clean_html_text(text)
+        assert cleaned == "Linia pierwsza Linia druga Linia trzecia"
+
+    def test_empty_input_returns_empty_string(self):
+        assert app.clean_html_text("") == ""
+        assert app.clean_html_text(None) == ""
+
+    def test_jsonld_description_with_raw_html_markup_is_cleaned(self):
+        # The actual Auchan bug: JSON-LD "description" contains a literal,
+        # ready-made HTML fragment instead of plain text.
+        html = """
+        <html><head>
+        <script type="application/ld+json">
+        {"@type": "Product", "name": "Produkt",
+         "description": "<div style=\\"font-weight:bold\\">Marka</div> <br> <p style=\\"margin:0\\">Informacje o skladzie, zastosowaniu i sposobie uzycia produktu na co dzien, w pelnej formie tekstowej.</p>"}
+        </script>
+        </head><body></body></html>
+        """
+        content = app.extract_page_content(html, "https://zakupy.auchan.pl/produkt")
+        assert "<div" not in content["context"]
+        assert "<br>" not in content["context"]
+        assert "<p" not in content["context"]
+        assert "style=" not in content["context"]
+        assert "Marka" in content["context"]
+        assert "Informacje o skladzie" in content["context"]
+
+
+class TestIsTrivialJsonldDescription:
+    def test_short_text_is_trivial(self):
+        assert app._is_trivial_jsonld_description("Marka Pantene") is True
+
+    def test_empty_or_none_is_trivial(self):
+        assert app._is_trivial_jsonld_description("") is True
+        assert app._is_trivial_jsonld_description(None) is True
+
+    def test_bare_brand_label_is_trivial_even_past_the_length_threshold(self):
+        # Over MIN_DESCRIPTION_LENGTH chars (not caught by the length check
+        # alone) but still just a 4-word brand label - the regex path must
+        # catch this too.
+        text = "Marka Bardzo-Dlugiej-Miedzynarodowej-Nazwy-Marketingowej-Kosmetycznej-Firmy Coco Mademoiselle Intensive"
+        assert len(text) >= app.MIN_DESCRIPTION_LENGTH
+        assert app._is_trivial_jsonld_description(text) is True
+
+    def test_real_sentence_starting_with_marka_is_not_trivial(self):
+        text = (
+            "Marka Informacje o skladzie i zastosowaniu produktu, ktory nawilza, "
+            "odzywia i regeneruje wlosy suche oraz zniszczone."
+        )
+        assert len(text) >= app.MIN_DESCRIPTION_LENGTH
+        assert app._is_trivial_jsonld_description(text) is False
+
+    def test_long_real_description_is_not_trivial(self):
+        text = (
+            "Szampon do wlosow suchych i zniszczonych, wzbogacony o kompleks "
+            "odzywczy Pro-V, ktory glebokp nawilza i regeneruje strukture wlosa."
+        )
+        assert app._is_trivial_jsonld_description(text) is False
+
+
+class TestJsonldStubFallsThroughToBodyDescription:
+    """Regression coverage for the zakupy.auchan.pl Pantene shampoo bug:
+    JSON-LD returning only a thin "Marka Pantene" stub must not be accepted
+    as the final description - the app must fall through to the full HTML
+    body description (skład, właściwości, opakowanie, ...)."""
+
+    def test_trivial_jsonld_falls_through_to_full_body_description(self):
+        html = """
+        <html><head>
+        <script type="application/ld+json">
+        {"@type": "Product", "name": "Szampon Pantene", "description": "Marka Pantene"}
+        </script>
+        </head><body>
+        <h1>Szampon Pantene Pro-V</h1>
+        <div id="description">
+        Szampon do wlosow suchych i zniszczonych z kompleksem Pro-V, ktory glebogo
+        nawilza, wygladza i chroni wlosy przed uszkodzeniami przy codziennym myciu.
+        </div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://zakupy.auchan.pl/szampon-pantene")
+        assert "Marka Pantene" not in content["context"]
+        assert "kompleksem Pro-V" in content["context"]
+        assert "nawilza" in content["context"]
+
+    def test_non_trivial_jsonld_description_is_still_used_directly(self):
+        html = """
+        <html><head>
+        <script type="application/ld+json">
+        {"@type": "Product", "name": "Szampon",
+         "description": "Szampon Pantene Pro-V do wlosow suchych i zniszczonych, wzbogacony o kompleks odzywczy oraz witaminy regenerujace."}
+        </script>
+        </head><body>
+        <div id="description">Zupelnie inny, dluzszy opis z body, ktory nie powinien zostac uzyty.</div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://zakupy.auchan.pl/produkt")
+        assert "kompleks odzywczy" in content["context"]
+        assert "Zupelnie inny" not in content["context"]
+
+
+class TestMultipleDescriptionSectionsCombined:
+    """Regression coverage: the parser used to stop at the FIRST matching
+    description container per rank - if a real description was split
+    across several sibling containers (e.g. multiple .product-info blocks
+    for "Opis"/"Działanie"), everything after the first was silently
+    dropped."""
+
+    def test_multiple_sibling_containers_at_same_rank_are_combined(self):
+        html = """
+        <html><head><title>Fallback</title></head><body>
+        <h1>Produkt testowy</h1>
+        <div class="product-description">Pierwsza sekcja opisu produktu.</div>
+        <div class="product-description">Druga sekcja opisu z dodatkowymi informacjami.</div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert "Pierwsza sekcja opisu produktu" in content["context"]
+        assert "Druga sekcja opisu z dodatkowymi informacjami" in content["context"]
+
+    def test_ingredients_and_attributes_sections_are_appended_to_main_description(self):
+        html = """
+        <html><head><title>Fallback</title></head><body>
+        <h1>Szampon Pantene</h1>
+        <div id="description">Szampon do wlosow suchych i zniszczonych.</div>
+        <div class="product-attributes">Pojemnosc: 400ml. Marka: Pantene.</div>
+        <div class="ingredients">Sklad: Aqua, Sodium Laureth Sulfate, Dimethicone.</div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://zakupy.auchan.pl/produkt")
+        assert "Szampon do wlosow suchych" in content["context"]
+        assert "Pojemnosc: 400ml" in content["context"]
+        assert "Sklad: Aqua" in content["context"]
+
+    def test_supplementary_section_excluded_from_cross_sell_widget(self):
+        html = """
+        <html><head><title>Fallback</title></head><body>
+        <h1>Produkt</h1>
+        <div id="description">Opis wlasciwego produktu.</div>
+        <div class="recommended">
+          <div class="ingredients">Sklad innego, polecanego produktu.</div>
+        </div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert "Opis wlasciwego produktu" in content["context"]
+        assert "innego, polecanego produktu" not in content["context"]
+
+
+class TestMinDescriptionLengthThreshold:
+    """Regression coverage for the "opis nadal zbyt krotki" follow-up bug:
+    MIN_DESCRIPTION_LENGTH = 100 is now enforced on every description
+    candidate (JSON-LD or HTML), with short HTML sections combined until
+    the threshold is cleared instead of being accepted as-is."""
+
+    def test_min_description_length_constant_is_100(self):
+        assert app.MIN_DESCRIPTION_LENGTH == 100
+
+    def test_short_jsonld_description_rejected_in_favor_of_longer_html(self):
+        short_jsonld = "Marka Pantene, znana marka kosmetykow do wlosow."
+        long_html = (
+            "Szampon do wlosow suchych i zniszczonych z formula odbudowujaca "
+            "strukture wlosa, nadajaca mu blask i miekkosc na co dzien."
+        )
+        assert len(short_jsonld) < app.MIN_DESCRIPTION_LENGTH
+        assert len(long_html) >= app.MIN_DESCRIPTION_LENGTH
+
+        html = f"""
+        <html><head>
+        <script type="application/ld+json">
+        {{"@type": "Product", "name": "Szampon", "description": "{short_jsonld}"}}
+        </script>
+        </head><body>
+        <div id="description">{long_html}</div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://zakupy.auchan.pl/produkt")
+        assert short_jsonld not in content["context"]
+        assert "formula odbudowujaca strukture wlosa" in content["context"]
+
+    def test_no_single_html_section_reaches_threshold_alone_so_they_are_combined(self):
+        desc_chunk = "Krotki ogolny opis produktu."
+        details_chunk = "Szczegoly techniczne produktu."
+        spec_chunk = "Specyfikacja obejmuje wage, wymiary oraz material wykonania tego konkretnego produktu."
+        # None of the three chunks alone clears the threshold, and neither
+        # do the first two together - only all three combined do.
+        assert len(desc_chunk) < app.MIN_DESCRIPTION_LENGTH
+        assert len(details_chunk) < app.MIN_DESCRIPTION_LENGTH
+        assert len(spec_chunk) < app.MIN_DESCRIPTION_LENGTH
+        assert len(desc_chunk) + 1 + len(details_chunk) < app.MIN_DESCRIPTION_LENGTH
+
+        html = f"""
+        <html><head><title>Fallback</title></head><body>
+        <h1>Produkt testowy</h1>
+        <div id="description">{desc_chunk}</div>
+        <div class="details">{details_chunk}</div>
+        <div class="specification">{spec_chunk}</div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://zakupy.auchan.pl/produkt")
+        assert desc_chunk in content["context"]
+        assert details_chunk in content["context"]
+        assert spec_chunk in content["context"]
+        desc_part = content["context"].split("Opis: ")[1]
+        assert len(desc_part) >= app.MIN_DESCRIPTION_LENGTH
+
+    def test_combined_sections_still_short_are_used_as_is_without_error(self):
+        # Even after combining everything available, the result stays under
+        # the threshold - the app must still use it (better than nothing)
+        # rather than erroring out or leaving the description empty.
+        html = """
+        <html><head><title>Fallback</title></head><body>
+        <h1>Produkt</h1>
+        <div id="description">Bardzo krotki opis.</div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://zakupy.auchan.pl/produkt")
+        assert "Bardzo krotki opis" in content["context"]
+
+
+class TestFallbackHtmlDescription:
+    """Regression coverage for zakupy.auchan.pl pages (e.g. Szampon
+    Pantene) that use NONE of the standard class/id/itemprop selectors at
+    all, so the normal cascade finds nothing and the context is left with
+    just "Produkt: <name>". find_fallback_html_description() is the last
+    resort: heading-labeled sections, then app-state JSON <script>s, then
+    the single longest paragraph-like block on the page."""
+
+    def test_heading_based_extraction_uses_parent_container_text(self):
+        heading_parent_text = (
+            "Szampon do wlosow suchych i zniszczonych z kompleksem odzywczym, "
+            "ktory regeneruje strukture wlosa na co dzien."
+        )
+        assert len(heading_parent_text) >= app.MIN_DESCRIPTION_LENGTH
+        html = f"""
+        <html><body>
+        <div class="section-xyz">
+          <h3>Opis produktu</h3>
+          <p>{heading_parent_text}</p>
+        </div>
+        </body></html>
+        """
+        result = app.find_fallback_html_description(html)
+        assert "kompleksem odzywczym" in result
+        assert len(result) >= app.MIN_DESCRIPTION_LENGTH
+
+    def test_heading_based_extraction_uses_following_siblings_when_no_shared_parent(self):
+        sib1 = "Pierwszy akapit opisu produktu z istotnymi informacjami."
+        sib2 = "Drugi akapit z dodatkowymi szczegolami technicznymi produktu."
+        html = f"""
+        <html><body>
+        <h3>Informacje o produkcie</h3>
+        <p>{sib1}</p>
+        <p>{sib2}</p>
+        <h3>Nastepna sekcja, ktora nie powinna zostac dolaczona</h3>
+        <p>Tresc zupelnie innej sekcji, ktora musi zostac pominieta.</p>
+        </body></html>
+        """
+        result = app.find_fallback_html_description(html)
+        assert sib1 in result
+        assert sib2 in result
+        assert "innej sekcji" not in result
+
+    def test_heading_phrase_matching_is_case_insensitive_and_covers_all_listed_phrases(self):
+        for phrase in ("SKŁADNIKI", "O Produkcie", "szczegóły", "Składniki, alergeny"):
+            html = f"""
+            <html><body>
+            <h3>{phrase}</h3>
+            <p>Tresc sekcji zawierajaca wystarczajaco duzo znakow, aby zostac
+            uznana za poprawny kandydujacy opis produktu w tescie.</p>
+            </body></html>
+            """
+            result = app.find_fallback_html_description(html)
+            assert "Tresc sekcji" in result, f"failed for heading phrase {phrase!r}"
+
+    def test_next_data_script_is_scanned_for_description_key(self):
+        nextdata_desc = (
+            "Pelny opis produktu pobrany z danych aplikacji Next.js, "
+            "zawierajacy sklad oraz zastosowanie kosmetyku."
+        )
+        assert len(nextdata_desc) >= app.MIN_DESCRIPTION_LENGTH
+        state = {"props": {"pageProps": {"product": {"name": "Szampon", "description": nextdata_desc}}}}
+        html = f"""
+        <html><body>
+        <script id="__NEXT_DATA__" type="application/json">{json.dumps(state)}</script>
+        </body></html>
+        """
+        result = app.find_fallback_html_description(html)
+        assert result == nextdata_desc
+
+    def test_generic_application_json_script_is_also_scanned(self):
+        longer_desc = "Opis produktu zapisany w generycznym skrypcie JSON stanu aplikacji sklepu internetowego, w pelnej formie."
+        assert len(longer_desc) >= app.MIN_DESCRIPTION_LENGTH
+        state = {"productDetails": longer_desc}
+        html = f"""
+        <html><body>
+        <script type="application/json">{json.dumps(state)}</script>
+        </body></html>
+        """
+        result = app.find_fallback_html_description(html)
+        assert result == longer_desc
+
+    def test_longest_paragraph_is_used_as_absolute_last_resort(self):
+        longest_p = (
+            "To jest najdluzszy akapit na stronie, zawierajacy realny opis "
+            "produktu z istotnymi szczegolami technicznymi i uzytkowymi."
+        )
+        nav_p = (
+            "To jest bardzo dlugi tekst nawigacyjny umieszczony w stopce strony, "
+            "ktory zdecydowanie nie powinien zostac uzyty jako opis produktu wcale, nigdy."
+        )
+        assert len(nav_p) > len(longest_p)  # the excluded text is the longer one
+        html = f"""
+        <html><body>
+        <footer><p>{nav_p}</p></footer>
+        <div class="something-unrecognizable">
+          <p>Krotki akapit.</p>
+          <p>{longest_p}</p>
+        </div>
+        </body></html>
+        """
+        result = app.find_fallback_html_description(html)
+        assert result == longest_p
+
+    def test_returns_empty_string_when_nothing_is_found(self):
+        html = "<html><body><h1>Produkt</h1></body></html>"
+        assert app.find_fallback_html_description(html) == ""
+
+    def test_end_to_end_pantene_style_page_with_no_standard_selectors(self):
+        # The actual reported bug: JSON-LD gives only a brand stub, and the
+        # body uses no recognizable class/id/itemprop at all - only a
+        # heading-labeled section identifies the real description.
+        heading_parent_text = (
+            "Szampon Pantene Pro-V do wlosow suchych i zniszczonych, z kompleksem "
+            "odzywczym oraz witaminami regenerujacymi strukture wlosa."
+        )
+        assert len(heading_parent_text) >= app.MIN_DESCRIPTION_LENGTH
+        html = f"""
+        <html><head>
+        <script type="application/ld+json">
+        {{"@type": "Product", "name": "Szampon Pantene", "description": "Marka Pantene"}}
+        </script>
+        </head><body>
+        <h1>Szampon Pantene Pro-V</h1>
+        <div class="section-abc123">
+          <h4>Opis produktu</h4>
+          <p>{heading_parent_text}</p>
+        </div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://zakupy.auchan.pl/szampon-pantene")
+        assert "Marka Pantene" not in content["context"]
+        assert "kompleksem odzywczym" in content["context"]
+        assert content["context"].startswith("Produkt: Szampon Pantene Pro-V")
+
+
+class TestAuchanJunkKeywords:
+    """Regression coverage for the zakupy.auchan.pl banner/icon leak: promo
+    banners and store icons (nowosc.png, piggy_2.png, jakkupowac.png,
+    b2b.png, kategoria-okazje.png) were showing up as "other" images."""
+
+    @pytest.mark.parametrize("url", [
+        "https://zakupy.auchan.pl/img/jakkupowac.png",
+        "https://zakupy.auchan.pl/img/piggy_2.png",
+        "https://zakupy.auchan.pl/img/nowosc.png",
+        "https://zakupy.auchan.pl/img/marki-premium.png",
+        "https://zakupy.auchan.pl/img/b2b.png",
+        "https://zakupy.auchan.pl/img/kategoria-okazje.png",
+        "https://zakupy.auchan.pl/img/zgarnij-rabat.png",
+        "https://zakupy.auchan.pl/img/gazetka-promocji.png",
+        "https://zakupy.auchan.pl/img/kategoria-sezonowe.png",
+        "https://zakupy.auchan.pl/img/kategoria-partnerzy.png",
+        "https://zakupy.auchan.pl/icons/sezonowe.png",
+        "https://zakupy.auchan.pl/icons/partnerzy.png",
+    ])
+    def test_is_junk_image_flags_auchan_specific_keywords(self, url):
+        assert app._is_junk_image(url) is True
+
+    def test_other_urls_excludes_auchan_banners_and_icons(self):
+        html = """
+        <html><head>
+        <meta property="og:image" content="https://zakupy.auchan.pl/img/produkt-glowny.jpg">
+        </head><body>
+        <img src="https://zakupy.auchan.pl/img/produkt-detal.jpg">
+        <img src="https://zakupy.auchan.pl/img/nowosc.png">
+        <img src="https://zakupy.auchan.pl/img/piggy_2.png">
+        <img src="https://zakupy.auchan.pl/img/jakkupowac.png">
+        <img src="https://zakupy.auchan.pl/img/b2b.png">
+        <img src="https://zakupy.auchan.pl/img/kategoria-okazje.png">
+        <img src="https://zakupy.auchan.pl/img/kategoria-sezonowe.png">
+        <img src="https://zakupy.auchan.pl/img/kategoria-partnerzy.png">
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://zakupy.auchan.pl/produkt")
+        assert content["main_url"] == "https://zakupy.auchan.pl/img/produkt-glowny.jpg"
+        assert content["other_urls"] == ["https://zakupy.auchan.pl/img/produkt-detal.jpg"]
 
 
 class TestTruncateToSentence:
@@ -407,7 +832,7 @@ class TestDescriptionContextLeakPrevention:
         <html><head><title>Fallback</title>
         <script type="application/ld+json">
         {"@context": "https://schema.org", "@type": "Product", "name": "Krzeselko do karmienia",
-         "description": "Krzeselko do karmienia regulowane na 6 poziomow wysokosci, tacka zdejmowana."}
+         "description": "Krzeselko do karmienia regulowane na 6 poziomow wysokosci, z tacka zdejmowana oraz pasami zabezpieczajacymi dziecko."}
         </script>
         </head><body>
         <h1>Krzeselko do karmienia</h1>

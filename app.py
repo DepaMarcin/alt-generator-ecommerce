@@ -204,6 +204,11 @@ _CONTENT_SKIP_TAGS = {"style", "script", "noscript", "svg"}
 # generic <article>/<main> fallback) - a broad fallback is exactly how
 # cross-sell/recommendation widget text used to leak into the context.
 DESCRIPTION_MAX_CHARS = 1000
+# A description candidate (JSON-LD or HTML) shorter than this isn't treated
+# as a full-fledged description - some Auchan pages return a stub like
+# "Marka Pantene" from JSON-LD, or split the real description across
+# several short HTML sections instead of one substantial block.
+MIN_DESCRIPTION_LENGTH = 100
 _DESCRIPTION_ID_RANKS = (
     ("description", 1),
     ("product-description", 2),
@@ -213,6 +218,19 @@ _DESCRIPTION_CLASS_RANKS = (
     ("product-description", 3),
     ("tab-content", 4),
     ("description-content", 6),
+)
+
+# Supplementary sections (skład/właściwości - "ingredients"/"properties")
+# that often live in their own container completely separate from the main
+# description - e.g. Auchan splits the general blurb, the attributes table,
+# and the ingredients list into three different elements. Their text is
+# combined with whichever main description wins the cascade above, rather
+# than competing with it for a single "best rank" slot.
+_SUPPLEMENTARY_ID_MARKERS = (
+    "product-info", "product-attributes", "ingredients", "details", "specification",
+)
+_SUPPLEMENTARY_CLASS_MARKERS = (
+    "product-info", "product-attributes", "ingredients", "details", "specification",
 )
 
 # Cross-sell/recommendation/navigation containers to ignore entirely while
@@ -269,6 +287,59 @@ def _description_container_rank(tag: str, attrs_dict: dict):
     return None
 
 
+def _is_supplementary_description_container(tag: str, attrs_dict: dict) -> bool:
+    """True for a "skład"/"właściwości" (ingredients/attributes) container -
+    see _SUPPLEMENTARY_ID_MARKERS/_SUPPLEMENTARY_CLASS_MARKERS above."""
+    elid = (attrs_dict.get("id") or "").strip().lower()
+    if elid in _SUPPLEMENTARY_ID_MARKERS:
+        return True
+
+    classes = (attrs_dict.get("class") or "").lower().split()
+    return any(marker in classes for marker in _SUPPLEMENTARY_CLASS_MARKERS)
+
+
+_TRIVIAL_BRAND_ONLY_RE = re.compile(r'^\s*marka\s*:?\s+(?P<rest>[^.!?]+)\.?\s*$', re.IGNORECASE)
+_TRIVIAL_BRAND_ONLY_MAX_WORDS = 4  # "Marka Pantene Pro-V Repair" - a real brand label, not a sentence
+
+
+def _is_trivial_jsonld_description(text: str) -> bool:
+    """True when a JSON-LD "description" is too thin to be useful on its
+    own - some Auchan product pages return just a brand-name stub like
+    "Marka Pantene" instead of the real product description. The cascade
+    should fall through to the full HTML body description instead of
+    accepting a stub like this as the final result.
+
+    Checks word count (not just character count) for the "Marka X" pattern
+    too, since a real sentence that happens to start with the word "Marka"
+    (e.g. "Marka Informacje o składzie i zastosowaniu...") would otherwise
+    be misjudged as trivial - a genuine brand label is only ever a few
+    words long, regardless of MIN_DESCRIPTION_LENGTH."""
+    if not text:
+        return True
+    stripped = text.strip()
+    if len(stripped) < MIN_DESCRIPTION_LENGTH:
+        return True
+    match = _TRIVIAL_BRAND_ONLY_RE.match(stripped)
+    return bool(match and len(match.group("rest").split()) <= _TRIVIAL_BRAND_ONLY_MAX_WORDS)
+
+
+_HTML_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def clean_html_text(text: str) -> str:
+    """Strips literal HTML markup out of a description that itself embeds
+    ready-made HTML (a JSON-LD "description" field - or a mis-encoded body
+    text node - containing raw <div style="...">/<br>/<p> instead of plain
+    text, as seen on zakupy.auchan.pl) instead of plain text, decodes HTML
+    entities (&nbsp;, &amp;, &quot;, ...), and collapses all whitespace/
+    newlines down to single spaces."""
+    if not text:
+        return ""
+    text = _HTML_TAG_RE.sub(' ', text)
+    text = html.unescape(text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
 _CSS_RULE_BLOCK_RE = re.compile(r'(?<!\w)[.#][\w-]+(?:::?[\w-]+)?(?:\s*,\s*[.#][\w-]+(?:::?[\w-]+)?)*\s*\{[^{}]*\}')
 _CSS_SELECTOR_TOKEN_RE = re.compile(r'(?<!\w)[.#][A-Za-z_][\w-]*(?:::?[A-Za-z-]+)?')
 
@@ -289,8 +360,9 @@ def _finalize_description_text(buffer: list) -> str:
     """Joins a captured description container's raw text fragments,
     dropping any individual fragment that looks like marketing/price noise
     leaked in from nearby widget chrome (a price tag, a 'Kup teraz' button)
-    rather than discarding the whole description over one bad fragment, and
-    stripping any leftover CSS-artifact text (see _strip_css_artifacts)."""
+    rather than discarding the whole description over one bad fragment,
+    stripping any raw HTML markup/entities (see clean_html_text) and
+    leftover CSS-artifact text (see _strip_css_artifacts)."""
     kept_fragments = []
     for fragment in buffer:
         collapsed = ' '.join(fragment.split())
@@ -300,7 +372,7 @@ def _finalize_description_text(buffer: list) -> str:
         if any(phrase in lowered for phrase in _DESCRIPTION_NOISE_PHRASES):
             continue
         kept_fragments.append(collapsed)
-    return _strip_css_artifacts(' '.join(kept_fragments))
+    return _strip_css_artifacts(clean_html_text(' '.join(kept_fragments)))
 
 
 _SENTENCE_END_CHARS = (".", "!", "?")
@@ -342,6 +414,8 @@ _JUNK_URL_KEYWORDS = (
     "facebook", "instagram", "footer", "header", "certyfikat", "trust", "star",
     "rating", "avatar", "button", "arrow", "placeholder",
     "share", "logo_share", "qr", "code", "og-", "og_", "ans.png",
+    "jakkupowac", "piggy", "nowosc", "marki-", "b2b", "okazje", "zgarnij", "promocj",
+    "kategoria-", "kategoria", "sezonowe", "partnerzy",
 )
 JUNK_IMAGE_MIN_DIMENSION_PX = 80
 
@@ -492,11 +566,297 @@ def _extract_jsonld_product_description(ld_json_blocks: list):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Last-resort description fallbacks - for pages like zakupy.auchan.pl that
+# don't use any of the standard class/id/itemprop selectors at all, so the
+# normal cascade above comes up with nothing (or something too short) and
+# the context would otherwise be left with just "Produkt: <name>". Only
+# ever invoked when everything above still hasn't reached
+# MIN_DESCRIPTION_LENGTH - building the little DOM tree below is extra work
+# that the common case (a page that DOES use recognizable selectors)
+# never needs to pay for.
+# ---------------------------------------------------------------------------
+
+class _DomNode:
+    """Minimal DOM element: just enough (tag/attrs/parent/children) to walk
+    up to a parent, across to following siblings, or down through
+    descendants - none of which a single-pass streaming parser can express
+    once it's already moved on. Not used for the main extraction cascade,
+    only for the fallback strategies below."""
+    __slots__ = ("tag", "attrs", "parent", "children")
+
+    def __init__(self, tag, attrs, parent=None):
+        self.tag = tag
+        self.attrs = attrs
+        self.parent = parent
+        self.children = []  # list of _DomNode | str
+
+    def own_text(self) -> str:
+        """Only this node's direct text, not its descendants' - so a huge
+        wrapper <div> doesn't look like it "contains" a giant paragraph."""
+        return ''.join(c for c in self.children if isinstance(c, str))
+
+    def full_text(self) -> str:
+        """This node's entire text content, descendants included (skipping
+        <style>/<script>/<noscript>/<svg> subtrees, same as the main
+        parser)."""
+        parts = []
+        for child in self.children:
+            if isinstance(child, str):
+                parts.append(child)
+            elif child.tag not in _CONTENT_SKIP_TAGS:
+                parts.append(child.full_text())
+        return ''.join(parts)
+
+
+class _SimpleDomBuilder(HTMLParser):
+    """Builds a _DomNode tree of the whole document. Deliberately tolerant
+    of malformed markup: handle_endtag pops back to the nearest matching
+    open tag (if any) instead of assuming well-formed nesting."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = _DomNode("[root]", {})
+        self._stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = _DomNode(tag, dict(attrs), parent=self._stack[-1])
+        self._stack[-1].children.append(node)
+        if tag not in _VOID_TAGS:
+            self._stack.append(node)
+
+    def handle_endtag(self, tag):
+        for i in range(len(self._stack) - 1, 0, -1):
+            if self._stack[i].tag == tag:
+                del self._stack[i:]
+                break
+
+    def handle_data(self, data):
+        self._stack[-1].children.append(data)
+
+
+def _build_simple_dom(html_text: str) -> _DomNode:
+    builder = _SimpleDomBuilder()
+    try:
+        builder.feed(html_text)
+    except Exception:
+        pass  # tolerate malformed markup - keep whatever was parsed so far
+    return builder.root
+
+
+def _iter_dom_nodes(node):
+    """Depth-first walk over every element node in the tree, in document
+    order."""
+    for child in node.children:
+        if not isinstance(child, str):
+            yield child
+            yield from _iter_dom_nodes(child)
+
+
+def _has_excluded_ancestor(node: _DomNode) -> bool:
+    current = node.parent
+    while current is not None:
+        if _is_excluded_description_container(current.tag, current.attrs):
+            return True
+        current = current.parent
+    return False
+
+
+def _following_siblings(node: _DomNode) -> list:
+    if node.parent is None:
+        return []
+    siblings = node.parent.children
+    try:
+        idx = siblings.index(node)
+    except ValueError:
+        return []
+    return siblings[idx + 1:]
+
+
+# 1. Heading-based extraction: a page that skips every standard selector
+# often still visually labels its description with a heading (or a <div>
+# styled to look like one).
+_HEADING_TAGS = {"h1", "h2", "h3", "h4", "strong", "b", "div"}
+_SECTION_BOUNDARY_TAGS = {"h1", "h2", "h3", "h4"}
+_HEADING_PHRASES = (
+    "opis produktu", "informacje o produkcie", "składniki", "o produkcie",
+    "szczegóły", "składniki, alergeny",
+)
+
+
+def _parent_has_other_heading_siblings(node: _DomNode) -> bool:
+    """True if node's parent holds more than one heading-level section -
+    in which case the parent is a broad multi-section container (e.g.
+    <body> itself), not a tight per-section wrapper, and its full text
+    would pull in unrelated sections too."""
+    if node.parent is None:
+        return False
+    return any(
+        isinstance(child, _DomNode) and child is not node and child.tag in _SECTION_BOUNDARY_TAGS
+        for child in node.parent.children
+    )
+
+
+def _find_heading_based_description(root: _DomNode) -> str:
+    for node in _iter_dom_nodes(root):
+        if node.tag not in _HEADING_TAGS or _has_excluded_ancestor(node):
+            continue
+
+        # A bare <div> is only trusted as a "heading" via its OWN text - a
+        # huge wrapper <div> would otherwise "match" just because the
+        # phrase appears somewhere, anywhere, in its entire subtree.
+        heading_text = clean_html_text(
+            node.own_text() if node.tag == "div" else node.full_text()
+        ).lower()
+        if not heading_text or not any(phrase in heading_text for phrase in _HEADING_PHRASES):
+            continue
+
+        # Try the parent container's full text first (covers the common
+        # <div><h3>Opis produktu</h3><p>...</p></div> shape) - but only if
+        # the parent looks like a tight, single-section wrapper. A parent
+        # holding several heading-level sections (e.g. <body> itself) would
+        # pull unrelated sections into the text too, so that case falls
+        # through to the sibling-walk below instead.
+        if node.parent is not None and not _parent_has_other_heading_siblings(node):
+            parent_text = clean_html_text(node.parent.full_text())
+            if len(parent_text) >= MIN_DESCRIPTION_LENGTH:
+                return parent_text
+
+        # Otherwise, walk the heading's own following siblings and combine
+        # their text until long enough, stopping at the next section.
+        combined = ""
+        for sibling in _following_siblings(node):
+            if isinstance(sibling, str):
+                chunk = clean_html_text(sibling)
+            else:
+                if sibling.tag in _SECTION_BOUNDARY_TAGS:
+                    break
+                chunk = clean_html_text(sibling.full_text())
+            if not chunk:
+                continue
+            combined = f"{combined} {chunk}".strip() if combined else chunk
+            if len(combined) >= MIN_DESCRIPTION_LENGTH:
+                break
+        if combined:
+            return combined
+
+    return ""
+
+
+# 2. App-state JSON scripts (Next.js/Nuxt/etc. embed the whole page's data
+# as JSON instead of - or in addition to - schema.org markup).
+_JSON_STATE_SCRIPT_ID_MARKERS = ("__next_data__", "__initial_state__")
+_JSON_STATE_DESCRIPTION_KEYS = (
+    "description", "longdescription", "ingredients", "attributes", "productdetails",
+)
+_JSON_SCAN_MAX_DEPTH = 12
+_JSON_SCAN_MAX_NODES = 20000
+
+
+def _search_json_for_description(data) -> str:
+    """Recursively scans a parsed JSON value for the longest string found
+    under a description-like key, bounded so a huge state blob can't make
+    this pathologically slow."""
+    best = ""
+    visited = [0]
+
+    def walk(value, depth):
+        nonlocal best
+        if visited[0] >= _JSON_SCAN_MAX_NODES or depth > _JSON_SCAN_MAX_DEPTH:
+            return
+        visited[0] += 1
+
+        if isinstance(value, dict):
+            for key, val in value.items():
+                if str(key).lower() in _JSON_STATE_DESCRIPTION_KEYS and isinstance(val, str):
+                    if len(val) > len(best):
+                        best = val
+                walk(val, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, depth + 1)
+
+    walk(data, 0)
+    return best
+
+
+def _find_json_state_description(root: _DomNode) -> str:
+    for node in _iter_dom_nodes(root):
+        if node.tag != "script":
+            continue
+        script_type = (node.attrs.get("type") or "").strip().lower()
+        script_id = (node.attrs.get("id") or "").strip().lower()
+        if script_type != "application/json" and script_id not in _JSON_STATE_SCRIPT_ID_MARKERS:
+            continue
+
+        raw = node.own_text().strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+
+        found = _search_json_for_description(data)
+        if found:
+            cleaned = clean_html_text(found)
+            if len(cleaned) >= MIN_DESCRIPTION_LENGTH:
+                return cleaned
+
+    return ""
+
+
+# 3. Absolute last resort: the single longest <p>/<div> text block on the
+# page, outside nav/header/footer/cross-sell-style containers.
+def _find_longest_paragraph_description(root: _DomNode) -> str:
+    best = ""
+    for node in _iter_dom_nodes(root):
+        if node.tag not in ("p", "div") or _has_excluded_ancestor(node):
+            continue
+        text = clean_html_text(node.own_text())
+        if len(text) > len(best):
+            best = text
+    return best
+
+
+def find_fallback_html_description(html_text: str) -> str:
+    """Last-resort description extraction, tried only when the standard
+    class/id/itemprop cascade still comes up short of MIN_DESCRIPTION_LENGTH.
+    Three escalating strategies, tried in order until one clears the
+    threshold: (1) a heading whose text matches a known "this is the
+    description" phrase, (2) any __NEXT_DATA__/__INITIAL_STATE__/
+    application/json <script> scanned for description-like keys, (3) the
+    single longest paragraph-like text block on the page. Returns the best
+    candidate found across all three even if it's still short - never
+    raises."""
+    root = _build_simple_dom(html_text)
+
+    best = ""
+    for finder in (
+        _find_heading_based_description,
+        _find_json_state_description,
+        _find_longest_paragraph_description,
+    ):
+        try:
+            candidate = finder(root)
+        except Exception:
+            candidate = ""
+        if candidate and len(candidate) > len(best):
+            best = candidate
+        if len(best) >= MIN_DESCRIPTION_LENGTH:
+            break
+
+    return best
+
+
 class _PageParser(HTMLParser):
     """Single pass over the page: captures <title>/<h1>/og:title (title
-    context), the actual body description text (from a product-description
-    container - never the SEO meta description, and never CSS/JS source
-    text leaking in from a nested <style>/<script>/<noscript>/<svg>), the
+    context), the actual body description text (from every matching
+    product-description container, not just the first one found - never
+    the SEO meta description, and never CSS/JS source text leaking in from
+    a nested <style>/<script>/<noscript>/<svg>), separately-scraped
+    supplementary text (skład/właściwości - "ingredients"/"attributes"
+    sections that often live outside the main description container), the
     main-image cascade signals (og:image/twitter:image, JSON-LD
     Product.image, fetchpriority/eager/gallery <img> hints), AND every
     <img> tag actually rendered on the page (so nothing gets missed)."""
@@ -511,7 +871,8 @@ class _PageParser(HTMLParser):
         self.img_attrs_by_url = {}  # raw <img> url -> its attrs dict (for the junk-image size check)
         self.priority_img_urls = []
         self.ld_json_blocks = []
-        self.description_candidates = {}  # rank -> first captured text for that rank
+        self.description_candidates = {}  # rank -> list of captured texts for that rank
+        self.supplementary_texts = []  # text from every product-info/product-attributes/ingredients container
         self._in_title = False
         self._in_h1 = False
         self._h1_done = False
@@ -522,6 +883,7 @@ class _PageParser(HTMLParser):
         self._seen_priority_urls = set()
         self._container_stack = []  # bool per open non-void ancestor: "looks like a gallery"
         self._description_stack = []  # {"rank": int, "buffer": list} per open non-void ancestor
+        self._supplementary_stack = []  # {"buffer": list} per open non-void ancestor (ingredients/attributes)
         self._excluded_stack = []  # bool per open non-void ancestor: "cross-sell/nav/widget etc."
         self._skip_stack = []  # bool per open non-void ancestor: "style/script/noscript/svg"
 
@@ -536,6 +898,9 @@ class _PageParser(HTMLParser):
         is_excluded_frame = _is_excluded_description_container(tag, attrs_dict)
         currently_excluded = is_excluded_frame or any(self._excluded_stack)
         description_rank = None if currently_excluded else _description_container_rank(tag, attrs_dict)
+        is_supplementary_frame = (
+            not currently_excluded and _is_supplementary_description_container(tag, attrs_dict)
+        )
         is_skip_frame = tag in _CONTENT_SKIP_TAGS
 
         if tag == "title":
@@ -589,6 +954,7 @@ class _PageParser(HTMLParser):
             self._description_stack.append(
                 {"rank": description_rank, "buffer": []} if description_rank is not None else None
             )
+            self._supplementary_stack.append({"buffer": []} if is_supplementary_frame else None)
             self._excluded_stack.append(is_excluded_frame)
             self._skip_stack.append(is_skip_frame)
 
@@ -614,10 +980,16 @@ class _PageParser(HTMLParser):
                 self._skip_stack.pop()
             if self._description_stack:
                 frame = self._description_stack.pop()
-                if frame is not None and frame["rank"] not in self.description_candidates:
+                if frame is not None:
                     text = _finalize_description_text(frame["buffer"])
                     if text:
-                        self.description_candidates[frame["rank"]] = text
+                        self.description_candidates.setdefault(frame["rank"], []).append(text)
+            if self._supplementary_stack:
+                supp_frame = self._supplementary_stack.pop()
+                if supp_frame is not None:
+                    text = _finalize_description_text(supp_frame["buffer"])
+                    if text:
+                        self.supplementary_texts.append(text)
 
     def handle_data(self, data):
         # <script type="application/ld+json"> content still needs capturing
@@ -636,6 +1008,9 @@ class _PageParser(HTMLParser):
         for frame in self._description_stack:
             if frame is not None:
                 frame["buffer"].append(data)
+        for supp_frame in self._supplementary_stack:
+            if supp_frame is not None:
+                supp_frame["buffer"].append(data)
 
 
 def extract_page_content(html_text: str, page_url: str) -> dict:
@@ -645,15 +1020,34 @@ def extract_page_content(html_text: str, page_url: str) -> dict:
 
     The description follows a cascade, strongest/safest signal first:
     (1) schema.org Product.description from JSON-LD - authored for exactly
-    this product, so it can never leak cross-sell/recommendation text;
-    (2) failing that, a dedicated description container in the body
-    (itemprop="description", #description, #product-description,
+    this product, so it can never leak cross-sell/recommendation text -
+    UNLESS it's shorter than MIN_DESCRIPTION_LENGTH, or just a bare
+    "Marka X" brand label (some Auchan pages return only that), in which
+    case it's treated as absent so the cascade falls through to (2);
+    (2) failing that, the single best-ranked description container in the
+    body (itemprop="description", #description, #product-description,
     .product-description, .tab-content, #tab-description,
-    .description-content) - with cross-sell/related/recommended/carousel/
-    widget/sidebar/header/footer/nav containers explicitly excluded from the
-    scan, and marketing/price fragments ("zł", "Kup teraz", ...) dropped
-    from whatever text is captured. NOT the SEO meta description, which is
-    usually marketing filler rather than real product knowledge.
+    .description-content - all siblings at that one rank combined, but
+    NOT lower-ranked alternatives too, since itemprop/#description/
+    .product-description etc. are competing signals for the same thing,
+    not complementary sections) - with cross-sell/related/recommended/
+    carousel/widget/sidebar/header/footer/nav containers explicitly excluded
+    from the scan, and marketing/price fragments ("zł", "Kup teraz", ...)
+    dropped from whatever text is captured. NOT the SEO meta description,
+    which is usually marketing filler rather than real product knowledge.
+
+    Whichever description wins (1) or (2) - if it's still under
+    MIN_DESCRIPTION_LENGTH, it's extended with supplementary sections
+    (#/.product-info, #/.product-attributes, #/.ingredients, #/.details,
+    #/.specification - these complement rather than compete with the main
+    description, so combining them in is always safe), in the order found,
+    until the combined text clears the threshold or they run out.
+
+    If it's STILL short (a page that doesn't use any recognizable selector
+    at all, e.g. zakupy.auchan.pl), find_fallback_html_description() is
+    tried as a last resort: a heading-labeled section, an app-state JSON
+    <script> (__NEXT_DATA__ and friends), then the single longest
+    paragraph-like block on the page - see that function for details.
 
     Every image candidate - main and "other" alike - is ranked into one
     pool, strongest signal first: (1) og:image/twitter:image meta tags,
@@ -682,17 +1076,50 @@ def extract_page_content(html_text: str, page_url: str) -> dict:
 
     title = re.sub(r'\s+', ' ', (parser.h1 or parser.og_title or parser.title or "").strip())
 
-    # Priority 1: schema.org Product.description from JSON-LD.
+    # Priority 1: schema.org Product.description from JSON-LD - unless it's
+    # just a thin brand-name stub, in which case treat it as absent.
     jsonld_description = _extract_jsonld_product_description(parser.ld_json_blocks)
+    description = ""
     if jsonld_description:
-        clean_jsonld_description = _strip_css_artifacts(re.sub(r'\s+', ' ', jsonld_description).strip())
-        description = _truncate_to_sentence(clean_jsonld_description)
-    else:
-        # Priority 2: a dedicated description container in the body.
-        description = ""
+        clean_jsonld_description = _strip_css_artifacts(clean_html_text(jsonld_description))
+        if not _is_trivial_jsonld_description(clean_jsonld_description):
+            description = clean_jsonld_description
+
+    if not description:
+        # Priority 2: JSON-LD was absent or too thin - use the best
+        # matching body description container instead (all its siblings at
+        # that rank combined). Deliberately does NOT fall back to a lower-
+        # ranked description container too (itemprop vs #description vs
+        # .product-description are competing alternatives for the same
+        # thing, not complementary sections) - only supplementary sections
+        # get combined in below.
         if parser.description_candidates:
             best_rank = min(parser.description_candidates)
-            description = _truncate_to_sentence(parser.description_candidates[best_rank].strip())
+            description = ' '.join(parser.description_candidates[best_rank]).strip()
+
+    # Whichever description won (JSON-LD or body) - if it's still short of
+    # MIN_DESCRIPTION_LENGTH, extend it with supplementary sections
+    # (ingredients/attributes/details/specification), in the order they
+    # were found, until it clears the threshold or they run out. These
+    # complement rather than compete with the main description, so they're
+    # always fair game to combine in, regardless of which priority won.
+    if len(description) < MIN_DESCRIPTION_LENGTH:
+        for chunk in parser.supplementary_texts:
+            if not chunk:
+                continue
+            description = f"{description} {chunk}".strip() if description else chunk
+            if len(description) >= MIN_DESCRIPTION_LENGTH:
+                break
+
+    # Still short (or empty) - the page likely doesn't use any of the
+    # standard selectors at all (e.g. zakupy.auchan.pl). Try the heading/
+    # JSON-state/longest-paragraph fallbacks before giving up.
+    if len(description) < MIN_DESCRIPTION_LENGTH:
+        fallback_description = find_fallback_html_description(html_text)
+        if len(fallback_description) > len(description):
+            description = fallback_description
+
+    description = _truncate_to_sentence(description) if description else ""
 
     context_parts = []
     if title:
