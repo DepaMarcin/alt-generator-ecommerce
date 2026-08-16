@@ -245,3 +245,77 @@ class TestQuotaExhaustedHandling:
         # No per-page error entries should have been recorded for the pages
         # that hit the quota wall - just the job-level stop.
         assert job["results"] == []
+
+
+class TestSitemapSupportRemoved:
+    """Regression coverage: sitemap.xml fetching/expansion was removed
+    entirely (shops kept 403-blocking the bot, and it was unnecessary
+    complexity) - a .xml/"sitemap"-looking URL must now be treated as a
+    literal page URL, never fetched-and-expanded, and the old
+    sitemap-specific functions must no longer exist on the module."""
+
+    def test_old_sitemap_functions_no_longer_exist(self):
+        assert not hasattr(app, "expand_seed_urls")
+        assert not hasattr(app, "fetch_sitemap_urls")
+        assert not hasattr(app, "_looks_like_sitemap_url")
+
+    def test_sitemap_looking_url_is_processed_as_a_literal_page(
+        self, registered_job, mocker, tmp_path
+    ):
+        task_id = registered_job("parsing")
+        mock_process_page = mocker.patch.object(
+            app, "process_page_url",
+            return_value={"page_url": "x", "context": "", "main_image": None, "other_images": []},
+        )
+
+        sitemap_looking_url = "https://sklep.pl/sitemap.xml"
+        app.background_worker(task_id, [sitemap_looking_url], str(tmp_path))
+
+        mock_process_page.assert_called_once_with(
+            sitemap_looking_url, str(tmp_path), task_id=task_id
+        )
+
+    def test_no_network_fetch_is_made_for_a_sitemap_looking_seed(
+        self, registered_job, mocker, tmp_path
+    ):
+        """download_image_from_url/fetch_page_html should never see a
+        sitemap-specific request - the URL flows straight through to the
+        normal page-fetch path (mocked here) with no XML parsing detour."""
+        task_id = registered_job("parsing")
+        mock_fetch_page = mocker.patch.object(
+            app, "fetch_page_html",
+            return_value=("<html><body></body></html>", "https://sklep.pl/sitemap.xml"),
+        )
+
+        app.background_worker(task_id, ["https://sklep.pl/sitemap.xml"], str(tmp_path))
+
+        assert mock_fetch_page.call_count == 1
+        assert mock_fetch_page.call_args[0][0] == "https://sklep.pl/sitemap.xml"
+
+
+class TestForbiddenPageFetchDoesNotStopBatch:
+    """A single page hitting a 403 (anti-bot protection, e.g. Answear) must
+    be recorded as a per-page error with a readable message - the batch
+    keeps going, only QuotaExhaustedError or CONSECUTIVE_ERROR_LIMIT stop it
+    entirely. Covers the curl_cffi/impersonation swap in fetch_page_html
+    (unit-level coverage for that lives in tests/test_parser.py)."""
+
+    def test_403_error_is_recorded_per_page_and_batch_completes(self, registered_job, mocker, tmp_path):
+        task_id = registered_job("parsing")
+        mocker.patch.object(
+            app, "fetch_page_html",
+            side_effect=ValueError(
+                "Serwer zablokował dostęp do strony (403 Forbidden) - sklep "
+                "prawdopodobnie stosuje zabezpieczenia anty-botowe."
+            ),
+        )
+
+        app.background_worker(task_id, ["https://answear.pl/produkt-1"], str(tmp_path))
+
+        with app.JOBS_LOCK:
+            job = dict(app.JOBS[task_id])
+
+        assert job["status"] == "completed"
+        assert job["processed"] == 1
+        assert job["error_count"] == 1
+        assert "403" in job["results"][0]["main_image"]["alt"]

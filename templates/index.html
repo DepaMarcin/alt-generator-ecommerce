@@ -39,15 +39,14 @@
     <section class="bg-white border-2 border-neutral-900 rounded-xl p-6 sm:p-8 shadow-sm">
       <h2 class="font-black uppercase text-lg tracking-wide mb-1">1. Wklej listę adresów URL</h2>
       <p class="text-sm text-neutral-500 mb-6">
-        Jeden adres na linijkę (maks. {{ max_urls_per_batch }}). Link do <code class="bg-neutral-100 px-1 rounded">sitemap.xml</code>
-        zostanie automatycznie rozwinięty na wszystkie podstrony, jakie zawiera.
+        Jeden adres na linijkę (maks. {{ max_urls_per_batch }}) - wyłącznie bezpośrednie linki do podstron produktowych.
       </p>
 
       <form id="upload-form">
         <label for="urls_text" class="block text-xs font-bold uppercase tracking-wide text-neutral-600 mb-1">
           Adresy URL
         </label>
-        <textarea id="urls_text" name="urls_text" rows="7" placeholder="https://sklep.pl/produkt/nazwa-produktu-1&#10;https://sklep.pl/produkt/nazwa-produktu-2&#10;https://sklep.pl/sitemap.xml"
+        <textarea id="urls_text" name="urls_text" rows="7" placeholder="https://sklep.pl/produkt/nazwa-produktu-1&#10;https://sklep.pl/produkt/nazwa-produktu-2&#10;https://sklep.pl/produkt/nazwa-produktu-3"
                   class="w-full border border-neutral-300 rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:border-[#00E676] focus:ring-2 focus:ring-emerald-100"></textarea>
 
         <div class="flex items-center gap-3 my-5">
@@ -313,7 +312,7 @@
 
     if (job.status === 'parsing') {
       progressStatus.textContent = 'Przygotowywanie listy adresów...';
-      progressText.textContent = 'Wczytywanie adresów (rozwijanie sitemap, jeśli podano)...';
+      progressText.textContent = 'Wczytywanie adresów URL...';
     } else if (job.status === 'processing') {
       progressStatus.textContent = 'Analiza AI w toku';
       progressText.textContent = `Przetworzono ${processed} z ${total} podstron...`;

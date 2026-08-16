@@ -3,7 +3,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-import requests
+from curl_cffi import requests as curl_requests
 
 # Belt-and-suspenders alongside pytest.ini's `pythonpath = .` - makes sure
 # `import app` works even if tests are invoked in a way that skips ini files.
@@ -30,7 +30,7 @@ def html_with_og_image():
     <html><head>
     <title>Sklep XYZ</title>
     <meta property="og:title" content="Cybex Priam wozek 2w1">
-    <meta property="og:image" content="https://cdn.sklep.pl/img/og-main.jpg">
+    <meta property="og:image" content="https://cdn.sklep.pl/img/product-main.jpg">
     <script type="application/ld+json">
     {"@type": "Product", "name": "Cybex Priam", "image": ["https://cdn.sklep.pl/img/jsonld-main.jpg"]}
     </script>
@@ -133,18 +133,20 @@ def dummy_image_path(tmp_path):
 @pytest.fixture
 def mock_html_fetch(mocker):
     """Patches the SSRF hostname guard (no real DNS lookups) and the
-    underlying requests.Session.get call, so fetch_page_html() can be
-    exercised against canned HTML without ever touching the network."""
+    underlying curl_cffi Session.get call (fetch_page_html's transport -
+    it impersonates a real Chrome to get past e-commerce anti-bot
+    protection), so fetch_page_html() can be exercised against canned HTML
+    without ever touching the network."""
     mocker.patch.object(app, "_check_hostname_is_public", return_value=None)
 
-    def _configure(html_text: str, content_type: str = "text/html"):
+    def _configure(html_text: str, content_type: str = "text/html", status_code: int = 200):
         fake_response = mocker.MagicMock()
         fake_response.is_redirect = False
-        fake_response.is_permanent_redirect = False
+        fake_response.status_code = status_code
         fake_response.raise_for_status.return_value = None
         fake_response.headers = {"Content-Type": content_type}
         fake_response.iter_content.return_value = [html_text.encode("utf-8")]
-        mocker.patch.object(requests.Session, "get", return_value=fake_response)
+        mocker.patch.object(curl_requests.Session, "get", return_value=fake_response)
         return fake_response
 
     return _configure

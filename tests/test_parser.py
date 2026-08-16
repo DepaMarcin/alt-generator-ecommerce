@@ -1,10 +1,13 @@
+import pytest
+from curl_cffi import requests as curl_requests
+
 import app
 
 
 class TestMainImageCascade:
     def test_priority_1_og_image_wins(self, html_with_og_image):
         content = app.extract_page_content(html_with_og_image, "https://sklep.pl/produkt")
-        assert content["main_url"] == "https://cdn.sklep.pl/img/og-main.jpg"
+        assert content["main_url"] == "https://cdn.sklep.pl/img/product-main.jpg"
 
     def test_priority_2_jsonld_product_image(self, html_with_jsonld_only):
         content = app.extract_page_content(html_with_jsonld_only, "https://sklep.pl/produkt")
@@ -87,18 +90,60 @@ class TestJunkImageFilter:
         content = app.extract_page_content(html, "https://sklep.pl/produkt")
         assert content["other_urls"] == ["https://cdn.sklep.pl/img/gallery-2.jpg"]
 
-    def test_main_image_is_never_junk_filtered(self):
-        # og:image is trusted as-is even if its URL happens to contain a
-        # junk keyword - only the "other images" pool is filtered.
+    def test_legitimate_og_image_is_still_used_as_main(self):
+        # Sanity check for the happy path: a real, non-junk og:image is
+        # still trusted as the main photo.
         html = """
         <html><head>
-        <meta property="og:image" content="https://cdn.sklep.pl/img/banner-hero-product.jpg">
+        <meta property="og:image" content="https://cdn.sklep.pl/img/product-front-view.jpg">
         </head><body>
         <img src="https://cdn.sklep.pl/img/second-photo.jpg">
         </body></html>
         """
         content = app.extract_page_content(html, "https://sklep.pl/produkt")
-        assert content["main_url"] == "https://cdn.sklep.pl/img/banner-hero-product.jpg"
+        assert content["main_url"] == "https://cdn.sklep.pl/img/product-front-view.jpg"
+
+    def test_junk_og_image_is_rejected_and_next_candidate_promoted_to_main(self):
+        # Regression coverage for the Answear bug: og:image pointing at a
+        # share icon must NOT become main_url - the next real candidate
+        # (here, a gallery photo) gets promoted instead.
+        html = """
+        <html><head>
+        <meta property="og:image" content="https://cdn.sklep.pl/img/logo_share.ans.png">
+        </head><body>
+        <div class="gallery"><img src="https://cdn.sklep.pl/img/product_F1.jpg"></div>
+        <img src="https://cdn.sklep.pl/img/qr-code.png">
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert content["main_url"] == "https://cdn.sklep.pl/img/product_F1.jpg"
+        assert "https://cdn.sklep.pl/img/logo_share.ans.png" not in content["other_urls"]
+        assert "https://cdn.sklep.pl/img/qr-code.png" not in content["other_urls"]
+
+    def test_junk_priority_gallery_image_falls_through_to_plain_body_image(self):
+        # No og:image/JSON-LD at all here - the only "priority" signal is a
+        # share icon sitting inside the gallery container, which must be
+        # skipped in favor of the first genuinely non-junk <img> on the page.
+        html = """
+        <html><head><title>Sklep XYZ</title></head><body>
+        <div class="gallery"><img src="https://cdn.sklep.pl/img/share-button.png"></div>
+        <img src="https://cdn.sklep.pl/img/product_1.jpg">
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert content["main_url"] == "https://cdn.sklep.pl/img/product_1.jpg"
+
+    def test_all_candidates_junk_yields_no_main_image(self):
+        html = """
+        <html><head>
+        <meta property="og:image" content="https://cdn.sklep.pl/img/logo_share.ans.png">
+        </head><body>
+        <img src="https://cdn.sklep.pl/img/qr-code.png">
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert content["main_url"] is None
+        assert content["other_urls"] == []
 
 
 class TestMaxImagesPerPageCap:
@@ -200,6 +245,82 @@ class TestBodyDescriptionExtraction:
         content = app.extract_page_content(html, "https://sklep.pl/produkt")
         desc_part = content["context"].split("Opis: ")[1]
         assert len(desc_part) <= app.DESCRIPTION_MAX_CHARS
+
+
+class TestStyleScriptContentExcludedFromDescription:
+    """Regression coverage for the Answear bug: a <style> block nested
+    inside the description container was leaking raw CSS rules (e.g.
+    ".Icon_icon-v_XzHkY:before { content: "\\D"; }") into the extracted
+    product description/context."""
+
+    def test_style_tag_inside_description_container_is_ignored(self):
+        html = """
+        <html><head><title>Fallback</title></head><body>
+        <h1>Produkt testowy</h1>
+        <div id="description">
+          <style>.Icon_icon-v_XzHkY:before { content: "\\D"; } .btn { color: red; }</style>
+          Prawdziwy opis produktu, ktory powinien zostac zachowany w calosci.
+        </div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert "Prawdziwy opis produktu" in content["context"]
+        assert "Icon_icon-v_XzHkY" not in content["context"]
+        assert "content:" not in content["context"]
+        assert "{" not in content["context"] and "}" not in content["context"]
+
+    def test_script_and_noscript_inside_description_container_are_ignored(self):
+        html = """
+        <html><head><title>Fallback</title></head><body>
+        <h1>Produkt testowy</h1>
+        <div class="product-description">
+          <script>var trackingId = "abc123"; console.log(trackingId);</script>
+          <noscript>Wlacz JavaScript, aby zobaczyc pelna tresc.</noscript>
+          Opis wlasciwy produktu bez zadnego szumu technicznego.
+        </div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert "Opis wlasciwy produktu" in content["context"]
+        assert "trackingId" not in content["context"]
+        assert "Wlacz JavaScript" not in content["context"]
+
+    def test_svg_markup_inside_description_container_is_ignored(self):
+        html = """
+        <html><head><title>Fallback</title></head><body>
+        <h1>Produkt testowy</h1>
+        <div id="description">
+          <svg viewBox="0 0 24 24"><path d="M12 2L2 7"></path><title>strzalka</title></svg>
+          Opis produktu bez tresci z wektorowej ikony svg.
+        </div>
+        </body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert "Opis produktu bez tresci" in content["context"]
+        assert "strzalka" not in content["context"]
+
+    def test_jsonld_still_captured_even_though_script_is_a_skip_tag(self):
+        # <script type="application/ld+json"> must still be parsed for its
+        # structured data even though plain <script> content is skipped
+        # everywhere else.
+        html = """
+        <html><head>
+        <script type="application/ld+json">
+        {"@type": "Product", "name": "Produkt", "description": "Opis produktu z danych strukturalnych."}
+        </script>
+        </head><body></body></html>
+        """
+        content = app.extract_page_content(html, "https://sklep.pl/produkt")
+        assert "Opis produktu z danych strukturalnych" in content["context"]
+
+    def test_css_artifact_regex_strips_rule_blocks_and_bare_selectors(self):
+        text = 'Prawdziwy tekst. .Icon_icon-v_XzHkY:before { content: "\\D"; } #footer { display:none; } Reszta opisu.'
+        cleaned = app._strip_css_artifacts(text)
+        assert "Prawdziwy tekst." in cleaned
+        assert "Reszta opisu." in cleaned
+        assert "{" not in cleaned and "}" not in cleaned
+        assert "Icon_icon-v_XzHkY" not in cleaned
+        assert "#footer" not in cleaned
 
 
 class TestTruncateToSentence:
@@ -355,7 +476,7 @@ class TestFetchPageHtmlWithMockedRequests:
     def test_fetch_page_html_returns_mocked_content(self, mock_html_fetch, html_with_og_image):
         mock_html_fetch(html_with_og_image)
         html_text, final_url = app.fetch_page_html("https://sklep.pl/produkt")
-        assert "og-main.jpg" in html_text
+        assert "product-main.jpg" in html_text
         assert final_url == "https://sklep.pl/produkt"
 
     def test_fetch_page_html_rejects_non_html_content_type(self, mock_html_fetch):
@@ -365,3 +486,67 @@ class TestFetchPageHtmlWithMockedRequests:
             assert False, "expected ValueError for a non-HTML content type"
         except ValueError:
             pass
+
+
+class TestFetchPageHtmlAntiBotImpersonation:
+    """Regression coverage for the curl_cffi Chrome-impersonation swap: a
+    lot of e-commerce anti-bot protection (Answear and friends) flat-out
+    403s plain `requests`, so fetch_page_html must go through curl_cffi
+    with impersonate="chrome120" plus a realistic Chrome header set, and a
+    403 must come back as a clean, catchable Polish error - not a crash."""
+
+    def _stub_session(self, mocker, status_code=200, html_text="<html></html>"):
+        fake_response = mocker.MagicMock()
+        fake_response.is_redirect = False
+        fake_response.status_code = status_code
+        fake_response.headers = {"Content-Type": "text/html"}
+        fake_response.iter_content.return_value = [html_text.encode("utf-8")]
+        if status_code >= 400:
+            fake_response.raise_for_status.side_effect = curl_requests.RequestsError(
+                f"HTTP Error {status_code}:", response=fake_response
+            )
+        else:
+            fake_response.raise_for_status.return_value = None
+
+        mocker.patch.object(app, "_check_hostname_is_public", return_value=None)
+        mock_session_cls = mocker.patch.object(app.curl_requests, "Session")
+        mock_session_cls.return_value.get.return_value = fake_response
+        return mock_session_cls
+
+    def test_uses_chrome120_impersonation(self, mocker):
+        mock_session_cls = self._stub_session(mocker)
+
+        app.fetch_page_html("https://sklep.pl/produkt")
+
+        assert app.PAGE_FETCH_IMPERSONATE == "chrome120"
+        mock_session_cls.assert_called_once_with(impersonate="chrome120")
+
+    def test_sends_realistic_chrome_headers(self, mocker):
+        mock_session_cls = self._stub_session(mocker)
+
+        app.fetch_page_html("https://sklep.pl/produkt")
+
+        _, call_kwargs = mock_session_cls.return_value.get.call_args
+        sent_headers = call_kwargs["headers"]
+        assert "Chrome" in sent_headers["User-Agent"]
+        assert sent_headers["Sec-Ch-Ua-Platform"] == '"Windows"'
+        assert sent_headers["Sec-Fetch-Mode"] == "navigate"
+        assert sent_headers == app.PAGE_FETCH_HEADERS
+
+    def test_403_response_becomes_a_readable_polish_error_not_a_crash(self, mocker):
+        self._stub_session(mocker, status_code=403)
+
+        with pytest.raises(ValueError) as exc_info:
+            app.fetch_page_html("https://sklep.pl/produkt")
+
+        message = str(exc_info.value)
+        assert "403" in message
+        assert "zablokował" in message.lower()
+
+    def test_other_http_error_also_becomes_a_readable_error(self, mocker):
+        self._stub_session(mocker, status_code=500)
+
+        with pytest.raises(ValueError) as exc_info:
+            app.fetch_page_html("https://sklep.pl/produkt")
+
+        assert "500" in str(exc_info.value)

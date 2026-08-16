@@ -1,5 +1,6 @@
 Flask
 requests
+curl_cffi
 openai
 Pillow
 python-dotenv

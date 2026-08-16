@@ -12,7 +12,6 @@ import shutil
 import random
 import json
 import html
-import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,6 +20,7 @@ from dotenv import load_dotenv
 from openai import OpenAI, RateLimitError
 from PIL import Image
 import requests
+from curl_cffi import requests as curl_requests
 
 load_dotenv()
 
@@ -46,14 +46,33 @@ TMP_UPLOADS_DIR = os.path.join(PROJECT_DIR, "tmp_uploads")
 os.makedirs(TMP_UPLOADS_DIR, exist_ok=True)
 
 CONSECUTIVE_ERROR_LIMIT = 5          # Isolated transient errors shouldn't abort the whole batch
-MAX_URLS_PER_BATCH = 1000            # Safety cap on how many page URLs one batch can queue (after sitemap expansion)
-MAX_SITEMAP_URLS_PER_FILE = 2000     # Cap per individual sitemap/sitemap-index fetch
-MAX_SITEMAP_DEPTH = 3                # How many levels of nested sitemap indexes to follow
+MAX_URLS_PER_BATCH = 1000            # Safety cap on how many page URLs one batch can queue
 MAX_IMAGES_PER_PAGE = 10             # Safety cap on how many images one page can queue (incl. the main image)
 MAX_RAW_IMAGE_CANDIDATES = 150       # How many raw <img> tags to scan per page before junk-filtering/capping
 PAGE_FETCH_TIMEOUT_SECONDS = 20
-MAX_PAGE_FETCH_BYTES = 15 * 1024 * 1024   # a product page's HTML/sitemap XML shouldn't exceed this
+MAX_PAGE_FETCH_BYTES = 15 * 1024 * 1024   # a product page's HTML shouldn't exceed this
 MAX_URL_REDIRECTS = 5
+
+# Plain `requests` gets a plaintext 403 from a lot of e-commerce anti-bot
+# protection (Cloudflare/Akamai-style TLS fingerprinting) - curl_cffi
+# impersonates a real Chrome's TLS/HTTP fingerprint instead, paired with the
+# matching set of headers a real Chrome navigation would send.
+PAGE_FETCH_IMPERSONATE = "chrome120"
+PAGE_FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -81,10 +100,13 @@ def _is_http_url(text: str) -> bool:
 
 def _fetch_url_bytes(url: str, max_bytes: int) -> tuple:
     """SSRF-guarded GET with manual redirect re-validation (each hop is
-    re-checked, same as the image downloader) and a byte-size cap. Returns
-    (content_bytes, final_url, content_type) - used for both page HTML and
-    sitemap XML fetches, which are always parsed in memory."""
-    session = requests.Session()
+    re-checked, same as the image downloader) and a byte-size cap. Uses
+    curl_cffi with a Chrome TLS/HTTP fingerprint (impersonate) plus a
+    matching realistic header set - plain `requests` gets flat-out 403'd by
+    a lot of e-commerce anti-bot protection (Cloudflare/Akamai-style TLS
+    fingerprinting) that this is specifically meant to get past. Returns
+    (content_bytes, final_url, content_type)."""
+    session = curl_requests.Session(impersonate=PAGE_FETCH_IMPERSONATE)
     current_url = url
 
     for _ in range(MAX_URL_REDIRECTS + 1):
@@ -93,19 +115,35 @@ def _fetch_url_bytes(url: str, max_bytes: int) -> tuple:
             raise ValueError("Nieprawidłowy URL (dozwolone są tylko linki http/https).")
         _check_hostname_is_public(parsed.hostname)
 
-        response = session.get(
-            current_url, stream=True, timeout=PAGE_FETCH_TIMEOUT_SECONDS,
-            headers={"User-Agent": "AltTextGenerator/1.0"}, allow_redirects=False,
-        )
         try:
-            if response.is_redirect or response.is_permanent_redirect:
+            response = session.get(
+                current_url, stream=True, timeout=PAGE_FETCH_TIMEOUT_SECONDS,
+                headers=PAGE_FETCH_HEADERS, allow_redirects=False,
+            )
+        except curl_requests.RequestsError as e:
+            # Network/TLS-level failure (DNS, connection reset, timeout, ...) -
+            # caught here so it surfaces as a plain, catchable ValueError like
+            # every other fetch failure, instead of a raw curl exception.
+            raise ValueError(f"Błąd sieciowy podczas pobierania strony: {e}") from e
+
+        try:
+            if response.is_redirect:
                 location = response.headers.get("Location")
                 if not location:
                     raise ValueError("Serwer zwrócił przekierowanie bez adresu docelowego.")
                 current_url = urljoin(current_url, location)
                 continue
 
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except curl_requests.RequestsError as e:
+                if response.status_code == 403:
+                    raise ValueError(
+                        "Serwer zablokował dostęp do strony (403 Forbidden) - sklep "
+                        "prawdopodobnie stosuje zabezpieczenia anty-botowe."
+                    ) from e
+                raise ValueError(f"Błąd HTTP {response.status_code} podczas pobierania strony.") from e
+
             content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
 
             chunks = []
@@ -151,6 +189,13 @@ _VOID_TAGS = {
     "area", "base", "br", "col", "embed", "hr", "img", "input",
     "link", "meta", "param", "source", "track", "wbr",
 }
+
+# Their raw contents are never real page text - <style>/<script> hold
+# CSS/JS source (a stray <style> block leaking CSS rules into the extracted
+# description was the actual root cause of the Answear ".Icon_icon-v_XzHkY
+# { content: ... }" bug), <noscript> holds fallback markup a real browser
+# never renders, and <svg> holds vector markup/metadata.
+_CONTENT_SKIP_TAGS = {"style", "script", "noscript", "svg"}
 
 # Real product-description containers, ranked best-match first - checked
 # against every open tag's itemprop/class/id so the body's actual
@@ -224,11 +269,28 @@ def _description_container_rank(tag: str, attrs_dict: dict):
     return None
 
 
+_CSS_RULE_BLOCK_RE = re.compile(r'(?<!\w)[.#][\w-]+(?:::?[\w-]+)?(?:\s*,\s*[.#][\w-]+(?:::?[\w-]+)?)*\s*\{[^{}]*\}')
+_CSS_SELECTOR_TOKEN_RE = re.compile(r'(?<!\w)[.#][A-Za-z_][\w-]*(?:::?[A-Za-z-]+)?')
+
+
+def _strip_css_artifacts(text: str) -> str:
+    """Defense-in-depth cleanup for CSS/selector-looking text that leaks
+    into an extracted description (a stray <style> block that slipped past
+    _PageParser's <style>/<script>/<noscript>/<svg> skip, or malformed
+    markup) - e.g. Answear's ".Icon_icon-v_XzHkY:before { content: ... }".
+    Strips whole "selector { declarations }" rule blocks first, then any
+    leftover bare .class/#id-looking tokens."""
+    text = _CSS_RULE_BLOCK_RE.sub(' ', text)
+    text = _CSS_SELECTOR_TOKEN_RE.sub(' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
 def _finalize_description_text(buffer: list) -> str:
     """Joins a captured description container's raw text fragments,
     dropping any individual fragment that looks like marketing/price noise
     leaked in from nearby widget chrome (a price tag, a 'Kup teraz' button)
-    rather than discarding the whole description over one bad fragment."""
+    rather than discarding the whole description over one bad fragment, and
+    stripping any leftover CSS-artifact text (see _strip_css_artifacts)."""
     kept_fragments = []
     for fragment in buffer:
         collapsed = ' '.join(fragment.split())
@@ -238,7 +300,7 @@ def _finalize_description_text(buffer: list) -> str:
         if any(phrase in lowered for phrase in _DESCRIPTION_NOISE_PHRASES):
             continue
         kept_fragments.append(collapsed)
-    return ' '.join(kept_fragments)
+    return _strip_css_artifacts(' '.join(kept_fragments))
 
 
 _SENTENCE_END_CHARS = (".", "!", "?")
@@ -279,6 +341,7 @@ _JUNK_URL_KEYWORDS = (
     "dostaw", "inpost", "dpd", "courier", "visa", "mastercard", "blik", "social",
     "facebook", "instagram", "footer", "header", "certyfikat", "trust", "star",
     "rating", "avatar", "button", "arrow", "placeholder",
+    "share", "logo_share", "qr", "code", "og-", "og_", "ans.png",
 )
 JUNK_IMAGE_MIN_DIMENSION_PX = 80
 
@@ -295,10 +358,13 @@ def _parse_pixel_size(value):
 
 def _is_junk_image(url: str, attrs_dict: dict = None) -> bool:
     """True for images that are almost certainly UI chrome/branding rather
-    than a real product photo - identified by a keyword in the URL, or by an
-    explicit width/height attribute under JUNK_IMAGE_MIN_DIMENSION_PX (an
-    icon-sized <img>). Only used to filter the "other images" pool - the
-    main image cascade (og:image/JSON-LD/gallery <img>) is trusted as-is."""
+    than a real product photo - identified by a keyword in the URL (logos,
+    share/QR-code icons, social/payment/delivery badges, watermark files
+    like Answear's "ans.png", ...), or by an explicit width/height
+    attribute under JUNK_IMAGE_MIN_DIMENSION_PX (an icon-sized <img>).
+    Applied to EVERY image candidate, including the main-image cascade - a
+    share icon or QR code must never be crowned "main image" just because
+    it happened to be the first og:image/gallery <img> on the page."""
     lowered = (url or "").lower()
     if any(keyword in lowered for keyword in _JUNK_URL_KEYWORDS):
         return True
@@ -429,10 +495,11 @@ def _extract_jsonld_product_description(ld_json_blocks: list):
 class _PageParser(HTMLParser):
     """Single pass over the page: captures <title>/<h1>/og:title (title
     context), the actual body description text (from a product-description
-    container - never the SEO meta description), the main-image cascade
-    signals (og:image/twitter:image, JSON-LD Product.image, fetchpriority/
-    eager/gallery <img> hints), AND every <img> tag actually rendered on the
-    page (so nothing gets missed)."""
+    container - never the SEO meta description, and never CSS/JS source
+    text leaking in from a nested <style>/<script>/<noscript>/<svg>), the
+    main-image cascade signals (og:image/twitter:image, JSON-LD
+    Product.image, fetchpriority/eager/gallery <img> hints), AND every
+    <img> tag actually rendered on the page (so nothing gets missed)."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -456,6 +523,7 @@ class _PageParser(HTMLParser):
         self._container_stack = []  # bool per open non-void ancestor: "looks like a gallery"
         self._description_stack = []  # {"rank": int, "buffer": list} per open non-void ancestor
         self._excluded_stack = []  # bool per open non-void ancestor: "cross-sell/nav/widget etc."
+        self._skip_stack = []  # bool per open non-void ancestor: "style/script/noscript/svg"
 
     def handle_starttag(self, tag, attrs):
         attrs_dict = dict(attrs)
@@ -468,6 +536,7 @@ class _PageParser(HTMLParser):
         is_excluded_frame = _is_excluded_description_container(tag, attrs_dict)
         currently_excluded = is_excluded_frame or any(self._excluded_stack)
         description_rank = None if currently_excluded else _description_container_rank(tag, attrs_dict)
+        is_skip_frame = tag in _CONTENT_SKIP_TAGS
 
         if tag == "title":
             self._in_title = True
@@ -521,6 +590,7 @@ class _PageParser(HTMLParser):
                 {"rank": description_rank, "buffer": []} if description_rank is not None else None
             )
             self._excluded_stack.append(is_excluded_frame)
+            self._skip_stack.append(is_skip_frame)
 
     def handle_endtag(self, tag):
         if tag == "title":
@@ -540,6 +610,8 @@ class _PageParser(HTMLParser):
                 self._container_stack.pop()
             if self._excluded_stack:
                 self._excluded_stack.pop()
+            if self._skip_stack:
+                self._skip_stack.pop()
             if self._description_stack:
                 frame = self._description_stack.pop()
                 if frame is not None and frame["rank"] not in self.description_candidates:
@@ -548,12 +620,19 @@ class _PageParser(HTMLParser):
                         self.description_candidates[frame["rank"]] = text
 
     def handle_data(self, data):
+        # <script type="application/ld+json"> content still needs capturing
+        # even though <script> is itself a skip-tag for every other buffer -
+        # it's structured data, not page text.
+        if self._in_ldjson:
+            self._ldjson_buffer += data
+
+        if any(self._skip_stack):
+            return  # inside <style>/<script>/<noscript>/<svg> - never real page text
+
         if self._in_title:
             self.title += data
         if self._in_h1:
             self._h1_buffer.append(data)
-        if self._in_ldjson:
-            self._ldjson_buffer += data
         for frame in self._description_stack:
             if frame is not None:
                 frame["buffer"].append(data)
@@ -576,23 +655,25 @@ def extract_page_content(html_text: str, page_url: str) -> dict:
     from whatever text is captured. NOT the SEO meta description, which is
     usually marketing filler rather than real product knowledge.
 
-    The main image is picked via a cascade, strongest signal first: (1)
-    og:image/twitter:image meta tags, (2) JSON-LD Product.image (often the
-    site's full product gallery - the rest of that array joins the "other"
-    pool below), (3) an <img> hinted as high-priority/eager or sitting
-    inside a gallery container - falling back to the first <img> on the page
-    if none of that is present. Every candidate URL is sanitized/decoded/
-    resolved to an absolute http(s) URL before use, and SVGs are always
-    excluded.
+    Every image candidate - main and "other" alike - is ranked into one
+    pool, strongest signal first: (1) og:image/twitter:image meta tags,
+    (2) JSON-LD Product.image (often the site's full product gallery),
+    (3) an <img> hinted as high-priority/eager or sitting inside a gallery
+    container, (4) every other <img> on the page. Every candidate URL is
+    sanitized/decoded/resolved to an absolute http(s) URL before use, and
+    SVGs are always excluded.
 
-    "Other" images (everything besides main_url) are additionally run
-    through _is_junk_image() - logos, payment/delivery/social/courier icons,
-    trust badges, ratings, avatars, buttons/arrows, placeholders, and any
-    <img> with an explicit width/height under JUNK_IMAGE_MIN_DIMENSION_PX
-    are dropped, since those are UI chrome, not product photos. The main
-    image itself is never junk-filtered - it's trusted as-is from the
-    cascade above. main_url + other_urls together never exceed
-    MAX_IMAGES_PER_PAGE."""
+    The WHOLE pool is then run through _is_junk_image() - logos, share/QR
+    icons, payment/delivery/social/courier badges, ratings, avatars,
+    buttons/arrows, placeholders, and any <img> with an explicit
+    width/height under JUNK_IMAGE_MIN_DIMENSION_PX are dropped, since those
+    are UI chrome, not product photos. main_url is the first candidate left
+    standing - so a share icon or QR code that happened to be the page's
+    og:image/first gallery <img> gets skipped in favor of the next real
+    product photo instead of being crowned "main image". Everything else
+    remaining becomes both the main-photo download-retry fallbacks and the
+    "other images" pool, capped so main_url + other_urls together never
+    exceed MAX_IMAGES_PER_PAGE."""
     parser = _PageParser()
     try:
         parser.feed(html_text)
@@ -604,7 +685,8 @@ def extract_page_content(html_text: str, page_url: str) -> dict:
     # Priority 1: schema.org Product.description from JSON-LD.
     jsonld_description = _extract_jsonld_product_description(parser.ld_json_blocks)
     if jsonld_description:
-        description = _truncate_to_sentence(re.sub(r'\s+', ' ', jsonld_description).strip())
+        clean_jsonld_description = _strip_css_artifacts(re.sub(r'\s+', ' ', jsonld_description).strip())
+        description = _truncate_to_sentence(clean_jsonld_description)
     else:
         # Priority 2: a dedicated description container in the body.
         description = ""
@@ -657,30 +739,29 @@ def extract_page_content(html_text: str, page_url: str) -> dict:
         if clean and clean not in clean_url_attrs:
             clean_url_attrs[clean] = parser.img_attrs_by_url.get(raw_url) or {}
 
+    # Full ranked candidate pool for the main photo, strongest signal first:
+    # og:image/twitter:image, then the rest of the JSON-LD gallery, then
+    # priority/gallery <img>, then everything else on the page. add_candidates
+    # dedupes globally, so this pool never repeats a URL across tiers.
     ranked_main_candidates = meta_candidates + jsonld_candidates + priority_candidates
-    main_url = ranked_main_candidates[0] if ranked_main_candidates else (body_images[0] if body_images else None)
+    full_candidate_pool = ranked_main_candidates + jsonld_gallery_extra + body_images
 
-    # Alternate main-photo candidates (retried if main_url 404s) - NOT
-    # junk-filtered, these are strong "this is the product photo" signals.
-    main_fallbacks = [u for u in ranked_main_candidates if u != main_url]
+    # The main image must ALSO pass the junk filter - a share icon, QR code,
+    # or logo must never be crowned "main image" just because it happened to
+    # be the first og:image/gallery <img> on the page. If the top-ranked
+    # candidate is junk, this naturally promotes the next clean one.
+    clean_candidates = [
+        u for u in full_candidate_pool if not _is_junk_image(u, clean_url_attrs.get(u))
+    ]
+    main_url = clean_candidates[0] if clean_candidates else None
 
-    # "Other" images: every remaining candidate (spare main-cascade signals,
-    # the rest of the JSON-LD gallery, spare body images), deduped and
-    # junk-filtered (logos/icons/badges/payment/delivery/social/UI chrome),
-    # capped so main_url + other_urls never exceeds MAX_IMAGES_PER_PAGE.
-    other_pool = main_fallbacks + jsonld_gallery_extra + [u for u in body_images if u != main_url]
+    # Every other clean candidate doubles as a download-retry fallback for
+    # the main photo and as the source for "other images", capped so
+    # main_url + other_urls never exceeds MAX_IMAGES_PER_PAGE.
+    remaining_clean = [u for u in clean_candidates if u != main_url]
+    main_fallbacks = remaining_clean
     other_budget = MAX_IMAGES_PER_PAGE - (1 if main_url else 0)
-    other_urls = []
-    other_seen = set()
-    for u in other_pool:
-        if u == main_url or u in other_seen:
-            continue
-        if _is_junk_image(u, clean_url_attrs.get(u)):
-            continue
-        other_seen.add(u)
-        other_urls.append(u)
-        if len(other_urls) >= other_budget:
-            break
+    other_urls = remaining_clean[:other_budget]
 
     return {
         "context": context,
@@ -689,87 +770,6 @@ def extract_page_content(html_text: str, page_url: str) -> dict:
         "main_fallbacks": main_fallbacks,
         "other_urls": other_urls,
     }
-
-
-# ---------------------------------------------------------------------------
-# Sitemap expansion
-# ---------------------------------------------------------------------------
-
-def _looks_like_sitemap_url(url: str) -> bool:
-    path = urlparse(url).path.lower()
-    return path.endswith(".xml") or "sitemap" in path
-
-
-def fetch_sitemap_urls(sitemap_url: str, depth: int = 0) -> list:
-    """Fetches a sitemap.xml (or sitemap index) and returns the page URLs it
-    lists, following nested sitemap indexes up to MAX_SITEMAP_DEPTH."""
-    if depth > MAX_SITEMAP_DEPTH:
-        return []
-
-    content, _final_url, _content_type = _fetch_url_bytes(sitemap_url, MAX_PAGE_FETCH_BYTES)
-    try:
-        root = ET.fromstring(content)
-    except ET.ParseError:
-        return []
-
-    tag = root.tag.lower()
-    urls = []
-
-    if tag.endswith("sitemapindex"):
-        sub_sitemaps = []
-        for sitemap_el in root:
-            for loc in sitemap_el.iter():
-                if loc.tag.lower().endswith("loc") and loc.text and loc.text.strip():
-                    sub_sitemaps.append(loc.text.strip())
-                    break
-            if len(sub_sitemaps) >= MAX_SITEMAP_URLS_PER_FILE:
-                break
-        for sub_url in sub_sitemaps:
-            if not _is_http_url(sub_url):
-                continue
-            try:
-                urls.extend(fetch_sitemap_urls(sub_url, depth=depth + 1))
-            except Exception:
-                continue
-            if len(urls) >= MAX_SITEMAP_URLS_PER_FILE:
-                break
-    elif tag.endswith("urlset"):
-        for url_el in root:
-            for loc in url_el.iter():
-                if loc.tag.lower().endswith("loc") and loc.text and loc.text.strip():
-                    loc_url = loc.text.strip()
-                    if _is_http_url(loc_url):
-                        urls.append(loc_url)
-                    break
-            if len(urls) >= MAX_SITEMAP_URLS_PER_FILE:
-                break
-
-    return urls[:MAX_SITEMAP_URLS_PER_FILE]
-
-
-def expand_seed_urls(seed_urls: list) -> list:
-    """Any seed that looks like (or turns out to be) a sitemap gets expanded
-    into the page URLs it lists; everything else is used as-is."""
-    final_urls = []
-    seen = set()
-    for seed in seed_urls:
-        candidates = [seed]
-        if _looks_like_sitemap_url(seed):
-            try:
-                sitemap_urls = fetch_sitemap_urls(seed)
-                if sitemap_urls:
-                    candidates = sitemap_urls
-            except Exception:
-                candidates = [seed]  # fall back to treating it as a literal page URL
-
-        for url in candidates:
-            if url not in seen:
-                seen.add(url)
-                final_urls.append(url)
-        if len(final_urls) >= MAX_URLS_PER_BATCH:
-            break
-
-    return final_urls[:MAX_URLS_PER_BATCH]
 
 
 def parse_url_list_text(raw_text: str) -> list:
@@ -1309,14 +1309,7 @@ def background_worker(task_id: str, seed_urls: list, job_dir: str):
             if task_id in JOBS:
                 JOBS[task_id]["status"] = "parsing"
 
-        try:
-            final_urls = expand_seed_urls(seed_urls)
-        except Exception as e:
-            with JOBS_LOCK:
-                if task_id in JOBS:
-                    JOBS[task_id]["status"] = "error"
-                    JOBS[task_id]["error_message"] = f"Błąd przygotowania listy adresów: {str(e)}"
-            return
+        final_urls = seed_urls
 
         if not final_urls:
             with JOBS_LOCK:
@@ -1456,8 +1449,8 @@ def generate_alt():
 
     if not seed_urls:
         return jsonify({
-            "error": "Wklej listę adresów URL (po jednym w linijce) albo wgraj plik .txt/.csv z linkami. "
-                     "Link do sitemap.xml zostanie automatycznie rozwinięty na wszystkie podstrony."
+            "error": "Wklej listę adresów URL podstron produktowych (po jednym w linijce) "
+                     "albo wgraj plik .txt/.csv z linkami."
         }), 400
 
     if len(seed_urls) > MAX_URLS_PER_BATCH:
