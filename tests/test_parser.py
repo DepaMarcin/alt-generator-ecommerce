@@ -165,8 +165,8 @@ class TestMaxImagesPerPageCap:
         assert total <= app.MAX_IMAGES_PER_PAGE
         assert len(content["other_urls"]) == app.MAX_IMAGES_PER_PAGE - 1
 
-    def test_max_images_per_page_is_ten(self):
-        assert app.MAX_IMAGES_PER_PAGE == 10
+    def test_max_images_per_page_is_twenty(self):
+        assert app.MAX_IMAGES_PER_PAGE == 20
 
 
 class TestJsonldFullGalleryExtraction:

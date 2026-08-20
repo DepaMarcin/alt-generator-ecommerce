@@ -47,7 +47,7 @@ os.makedirs(TMP_UPLOADS_DIR, exist_ok=True)
 
 CONSECUTIVE_ERROR_LIMIT = 5          # Isolated transient errors shouldn't abort the whole batch
 MAX_URLS_PER_BATCH = 1000            # Safety cap on how many page URLs one batch can queue
-MAX_IMAGES_PER_PAGE = 10             # Safety cap on how many images one page can queue (incl. the main image)
+MAX_IMAGES_PER_PAGE = 20             # Safety cap on how many images one page can queue (incl. the main image)
 MAX_RAW_IMAGE_CANDIDATES = 150       # How many raw <img> tags to scan per page before junk-filtering/capping
 PAGE_FETCH_TIMEOUT_SECONDS = 20
 MAX_PAGE_FETCH_BYTES = 15 * 1024 * 1024   # a product page's HTML shouldn't exceed this
